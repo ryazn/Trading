@@ -182,7 +182,9 @@ def main():
     initial_capital = cfg.get("risk", {}).get("initial_capital", 100000.0)
 
     # --- Run Backtest ---
-    print("\nRunning backtest...")
+    has_real_cvd = "cvd" in data.columns and data["cvd"].notna().sum() > 0
+    print(f"\nCVD Source: {'TradingView (real)' if has_real_cvd else 'Estimated (close vs open)'}")
+    print("Running backtest...")
     engine = BacktestEngine(initial_capital=initial_capital, risk_config=risk_config)
     report = engine.run(data, strategy, verbose=args.verbose)
 

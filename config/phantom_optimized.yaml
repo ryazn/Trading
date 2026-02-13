@@ -1,0 +1,89 @@
+# ================================================
+# PHANTOM CVD Strategy - OPTIMIZED Configuration
+# ================================================
+# Optimized via grid search on 2,138 bars of real ES 1-min data
+# (Feb 12-13, 2026)
+#
+# Best overall config: PF 4.09, 75% WR, $3,100 profit, 1.35% max DD
+# Best by net profit:  PF 1.78, 36% WR, $10,240 profit, 4.25% max DD
+#
+# This config uses the "balanced" approach - good PF with decent trade count
+
+data:
+  source: "csv"
+  csv_path: "CME_MINI_ES1!, 1_6378e.csv"
+
+strategy:
+  # CVD - use real CVD from TradingView export
+  cvd_smooth: 1
+  cvd_anchor_bars: 390
+
+  # Swing Detection - KEY FINDINGS:
+  # - pivot_left=10-15 works best (not too sensitive, not too slow)
+  # - pivot_right=1 is optimal (fast confirmation)
+  pivot_left: 10
+  pivot_right: 1
+  max_level_age: 100
+  max_levels: 30
+
+  # Sweep Detection - KEY FINDING:
+  # - sweep_ticks=3 filters out noise sweeps significantly
+  sweep_ticks: 3
+  tick_size: 0.25
+
+  # Strength Filter - KEY FINDING:
+  # - min_strength=0.5 filters weak divergences
+  # - strength_period=30 (shorter) captures recent CVD range better
+  min_strength: 0.5
+  strength_period: 30
+
+  # CVD Momentum - disabled for now (adds complexity, limited benefit on small sample)
+  use_momentum_filter: false
+  momentum_bars: 5
+  momentum_tolerance: 0.02
+
+  # Signal Control
+  signal_cooldown: 3
+
+  # Direction
+  allow_longs: true
+  allow_shorts: true
+
+risk:
+  initial_capital: 100000.0
+
+  # Position Sizing - risk-based
+  position_mode: "risk_per_trade"
+  risk_pct: 1.0
+
+  # Stop Loss - KEY FINDING:
+  # - ATR x 3.0 gives trades room to breathe (x2.0 caused too many stop-outs)
+  use_stop_loss: true
+  sl_mode: "atr"
+  sl_atr_mult: 3.0
+  sl_atr_period: 14
+
+  # Take Profit - KEY FINDING:
+  # - 3:1 R:R ratio produced the best net profit
+  # - 2:1 produced more consistent win rate
+  use_take_profit: true
+  tp_mode: "risk_reward"
+  tp_rr_ratio: 3.0
+
+  # Trailing/BE - disabled for cleaner signals
+  use_trailing: false
+  use_breakeven: false
+
+  # Session filter - disabled (data spans overnight)
+  use_session_filter: false
+
+  # Risk limits
+  use_max_drawdown: false
+  use_daily_loss_limit: false
+  use_max_hold: false
+
+  # Costs (ES futures)
+  commission_per_contract: 1.24
+  slippage_ticks: 1
+  tick_size: 0.25
+  point_value: 50.0

@@ -83,36 +83,43 @@ class PhantomCVDStrategy(BaseStrategy):
         n = len(self.closes)
 
         # --- Compute CVD ---
-        # Volume delta: positive if close > open, negative if close < open
-        delta = np.zeros(n)
-        for i in range(n):
-            if self.closes[i] > self.opens[i]:
-                delta[i] = self.volumes[i]
-            elif self.closes[i] < self.opens[i]:
-                delta[i] = -self.volumes[i]
-            else:
-                # Flat candle: use previous direction
-                if i > 0 and self.closes[i] > self.closes[i - 1]:
+        # Use real CVD from TradingView data if available
+        if self.data is not None and "cvd" in self.data.columns:
+            cvd_raw = self.data["cvd"].values.astype(float)
+            # Fill any NaN at the end
+            for i in range(len(cvd_raw)):
+                if np.isnan(cvd_raw[i]):
+                    cvd_raw[i] = cvd_raw[i - 1] if i > 0 else 0.0
+            self._using_real_cvd = True
+        else:
+            # Estimate CVD from bar direction (close vs open)
+            delta = np.zeros(n)
+            for i in range(n):
+                if self.closes[i] > self.opens[i]:
                     delta[i] = self.volumes[i]
-                elif i > 0 and self.closes[i] < self.closes[i - 1]:
+                elif self.closes[i] < self.opens[i]:
                     delta[i] = -self.volumes[i]
                 else:
-                    delta[i] = 0
+                    if i > 0 and self.closes[i] > self.closes[i - 1]:
+                        delta[i] = self.volumes[i]
+                    elif i > 0 and self.closes[i] < self.closes[i - 1]:
+                        delta[i] = -self.volumes[i]
+                    else:
+                        delta[i] = 0
 
-        # Cumulative with anchor reset
-        anchor = p["cvd_anchor_bars"]
-        cvd_raw = np.zeros(n)
-        cumulative = 0.0
-        for i in range(n):
-            if anchor > 0 and i % anchor == 0:
-                cumulative = 0.0
-            cumulative += delta[i]
-            cvd_raw[i] = cumulative
+            anchor = p["cvd_anchor_bars"]
+            cvd_raw = np.zeros(n)
+            cumulative = 0.0
+            for i in range(n):
+                if anchor > 0 and i % anchor == 0:
+                    cumulative = 0.0
+                cumulative += delta[i]
+                cvd_raw[i] = cumulative
+            self._using_real_cvd = False
 
         # Smooth with EMA
         if p["cvd_smooth"] > 1:
             self.cvd = self.ema(cvd_raw, p["cvd_smooth"])
-            # Fill initial NaN with raw values
             for i in range(len(self.cvd)):
                 if np.isnan(self.cvd[i]):
                     self.cvd[i] = cvd_raw[i]

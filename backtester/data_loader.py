@@ -13,7 +13,7 @@ from typing import Optional
 class DataLoader:
     """Load and prepare OHLCV bar data for backtesting."""
 
-    REQUIRED_COLUMNS = ["open", "high", "low", "close", "volume"]
+    REQUIRED_COLUMNS = ["open", "high", "low", "close"]
 
     def __init__(self):
         self._data: Optional[pd.DataFrame] = None
@@ -34,8 +34,12 @@ class DataLoader:
         """
         Load OHLCV data from a CSV file.
 
-        Expected columns: datetime/date, open, high, low, close, volume
+        Supports:
+        - Standard format: datetime, open, high, low, close, volume
+        - TradingView export: unix timestamp 'time', open, high, low, close, + extras (CVD, signals)
+
         Columns are case-insensitive (will be lowercased).
+        Extra columns (cvd, bullish entry, bearish entry) are preserved.
         """
         df = pd.read_csv(filepath, sep=separator)
         df.columns = [c.strip().lower() for c in df.columns]
@@ -52,7 +56,13 @@ class DataLoader:
                 f"No datetime column found. Available: {list(df.columns)}"
             )
 
-        if datetime_format:
+        # Detect unix timestamps (large integers) vs datetime strings
+        sample_val = df[dt_col].iloc[0]
+        if isinstance(sample_val, (int, float, np.integer, np.floating)) and sample_val > 1e9:
+            df[dt_col] = pd.to_datetime(df[dt_col], unit="s", utc=True)
+            # Convert to US/Eastern for ES futures
+            df[dt_col] = df[dt_col].dt.tz_convert("US/Eastern").dt.tz_localize(None)
+        elif datetime_format:
             df[dt_col] = pd.to_datetime(df[dt_col], format=datetime_format)
         else:
             df[dt_col] = pd.to_datetime(df[dt_col])
@@ -60,14 +70,23 @@ class DataLoader:
         df = df.set_index(dt_col)
         df.index.name = "datetime"
 
-        # Validate required columns
+        # Validate required columns (volume is optional for TV exports with CVD)
         missing = [c for c in self.REQUIRED_COLUMNS if c not in df.columns]
         if missing:
             raise ValueError(f"Missing required columns: {missing}")
 
-        # Ensure numeric types
-        for col in self.REQUIRED_COLUMNS:
+        # If no volume column, create a synthetic one (needed by engine)
+        if "volume" not in df.columns:
+            df["volume"] = 1000  # placeholder
+
+        # Ensure numeric types for core columns
+        for col in self.REQUIRED_COLUMNS + ["volume"]:
             df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        # Preserve extra columns (cvd, signals) as numeric
+        for col in df.columns:
+            if col not in self.REQUIRED_COLUMNS + ["volume"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
 
         df = df.dropna(subset=self.REQUIRED_COLUMNS)
         df = df.sort_index()
