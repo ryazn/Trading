@@ -4,7 +4,6 @@ __pycache__/
 .env
 .venv/
 venv/
-output/
 data/*.csv
 data/*.parquet
 *.egg-info/
