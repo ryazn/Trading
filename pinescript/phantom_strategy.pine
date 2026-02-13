@@ -1,0 +1,563 @@
+//@version=5
+strategy("PHANTOM STRATEGY", overlay=true, max_bars_back=5000, max_lines_count=100,
+     initial_capital=100000, default_qty_type=strategy.percent_of_equity,
+     default_qty_value=100, commission_type=strategy.commission.cash_per_contract,
+     commission_value=1.24, slippage=1, pyramiding=0,
+     process_orders_on_close=false, calc_on_every_tick=false,
+     currency=currency.USD)
+
+// ========================================
+// PHANTOM CVD Divergence Strategy v1.0
+// Converted from PHANTOM CHART indicator v3.1
+// Architecture: Track swing levels → Detect liquidity sweeps → Check CVD divergence
+// Entry on sweep + divergence, with full risk management suite
+// ========================================
+
+// ========== STRATEGY DIRECTION ==========
+trade_direction = input.string("Both", "Trade Direction", options=["Long Only", "Short Only", "Both"], group="Strategy Settings")
+allow_longs = trade_direction == "Long Only" or trade_direction == "Both"
+allow_shorts = trade_direction == "Short Only" or trade_direction == "Both"
+
+// ========== RISK MANAGEMENT ==========
+// --- Position Sizing ---
+position_mode = input.string("Percent of Equity", "Position Sizing Mode", options=["Percent of Equity", "Fixed Contracts", "Risk Per Trade"], group="Position Sizing")
+equity_pct = input.float(100.0, "Equity % per Trade", minval=1.0, maxval=100.0, step=5.0, group="Position Sizing", tooltip="Percentage of equity to allocate per trade")
+fixed_qty = input.int(1, "Fixed Contracts", minval=1, maxval=1000, group="Position Sizing", tooltip="Number of contracts when using Fixed mode")
+risk_pct = input.float(1.0, "Risk % per Trade", minval=0.1, maxval=10.0, step=0.1, group="Position Sizing", tooltip="Max equity % risked per trade (requires stop loss)")
+
+// --- Stop Loss ---
+use_stop_loss = input.bool(true, "Enable Stop Loss", group="Stop Loss")
+sl_mode = input.string("ATR", "Stop Loss Mode", options=["Fixed Points", "Percentage", "ATR", "Swept Level"], group="Stop Loss")
+sl_points = input.float(20.0, "SL Fixed Points", minval=0.5, maxval=500.0, step=0.5, group="Stop Loss")
+sl_percent = input.float(1.0, "SL Percentage", minval=0.1, maxval=20.0, step=0.1, group="Stop Loss")
+sl_atr_mult = input.float(2.0, "SL ATR Multiplier", minval=0.5, maxval=10.0, step=0.25, group="Stop Loss")
+sl_atr_period = input.int(14, "SL ATR Period", minval=5, maxval=50, group="Stop Loss")
+sl_swept_offset = input.float(2.0, "SL Offset Past Swept Level (ticks)", minval=0.0, maxval=20.0, step=0.5, group="Stop Loss", tooltip="Place SL this many ticks beyond the swept level")
+
+// --- Take Profit ---
+use_take_profit = input.bool(true, "Enable Take Profit", group="Take Profit")
+tp_mode = input.string("Risk:Reward", "Take Profit Mode", options=["Fixed Points", "Percentage", "ATR", "Risk:Reward"], group="Take Profit")
+tp_points = input.float(40.0, "TP Fixed Points", minval=0.5, maxval=1000.0, step=0.5, group="Take Profit")
+tp_percent = input.float(2.0, "TP Percentage", minval=0.1, maxval=40.0, step=0.1, group="Take Profit")
+tp_atr_mult = input.float(3.0, "TP ATR Multiplier", minval=0.5, maxval=20.0, step=0.25, group="Take Profit")
+tp_rr_ratio = input.float(2.0, "Risk:Reward Ratio", minval=0.5, maxval=10.0, step=0.25, group="Take Profit", tooltip="TP = SL distance * this ratio")
+
+// --- Trailing Stop ---
+use_trailing = input.bool(false, "Enable Trailing Stop", group="Trailing Stop")
+trail_mode = input.string("ATR", "Trailing Mode", options=["Fixed Points", "Percentage", "ATR"], group="Trailing Stop")
+trail_points = input.float(15.0, "Trail Fixed Points", minval=0.5, maxval=500.0, step=0.5, group="Trailing Stop")
+trail_percent = input.float(1.0, "Trail Percentage", minval=0.1, maxval=20.0, step=0.1, group="Trailing Stop")
+trail_atr_mult = input.float(1.5, "Trail ATR Multiplier", minval=0.5, maxval=10.0, step=0.25, group="Trailing Stop")
+
+// --- Break Even ---
+use_breakeven = input.bool(false, "Enable Break-Even Stop", group="Break Even")
+be_trigger_points = input.float(15.0, "BE Trigger (points in profit)", minval=1.0, maxval=200.0, step=1.0, group="Break Even", tooltip="Move SL to entry when price reaches this profit")
+be_offset = input.float(1.0, "BE Offset (points past entry)", minval=0.0, maxval=20.0, step=0.5, group="Break Even", tooltip="Offset past entry price for BE stop (covers commissions)")
+
+// --- Session Filter ---
+use_session_filter = input.bool(false, "Enable Session Filter", group="Session Filter")
+session_start = input.session("0930-1600", "Trading Session", group="Session Filter", tooltip="Only trade during this session (exchange timezone)")
+close_at_session_end = input.bool(false, "Close Positions at Session End", group="Session Filter")
+
+// --- Max Drawdown ---
+use_max_dd = input.bool(false, "Enable Max Drawdown Stop", group="Risk Limits")
+max_dd_pct = input.float(5.0, "Max Drawdown %", minval=1.0, maxval=50.0, step=1.0, group="Risk Limits", tooltip="Stop trading when drawdown exceeds this % of peak equity")
+use_daily_loss_limit = input.bool(false, "Enable Daily Loss Limit", group="Risk Limits")
+daily_loss_pct = input.float(2.0, "Max Daily Loss %", minval=0.5, maxval=20.0, step=0.5, group="Risk Limits")
+
+// --- Max Hold Time ---
+use_max_hold = input.bool(false, "Enable Max Hold Time", group="Time Exit")
+max_hold_bars = input.int(50, "Max Bars in Trade", minval=5, maxval=500, group="Time Exit", tooltip="Force exit after this many bars")
+
+// ========== CVD SETTINGS (from indicator) ==========
+cvd_anchor = input.timeframe("1D", "CVD Anchor Period", group="CVD Settings")
+use_custom_ltf = input.bool(false, "Use Custom CVD Timeframe", group="CVD Settings")
+cvd_ltf = input.timeframe("1", "CVD Lower Timeframe", group="CVD Settings")
+cvd_smooth = input.int(1, "CVD Smoothing (EMA)", minval=1, maxval=20, group="CVD Settings")
+
+// ========== SWING DETECTION (from indicator) ==========
+pivot_left = input.int(10, "Pivot Left Bars", minval=2, maxval=50, group="Swing Detection")
+pivot_right = input.int(1, "Pivot Right Bars", minval=1, maxval=10, group="Swing Detection")
+max_level_age = input.int(200, "Max Swing Level Age (bars)", minval=20, maxval=1000, group="Swing Detection")
+
+// ========== SWEEP DETECTION (from indicator) ==========
+sweep_ticks = input.int(1, "Sweep Threshold (ticks past level)", minval=1, maxval=10, group="Sweep Detection")
+
+// ========== STRENGTH FILTER (from indicator) ==========
+min_strength = input.float(0.5, "Min Divergence Strength", minval=0.0, maxval=1.0, step=0.05, group="Strength Filter")
+strength_period = input.int(50, "Strength Lookback Period", minval=10, maxval=200, group="Strength Filter")
+
+// ========== CVD MOMENTUM (from indicator) ==========
+use_momentum_filter = input.bool(false, "Require CVD Momentum Confirmation", group="CVD Momentum")
+momentum_bars = input.int(5, "Momentum Lookback (bars)", minval=2, maxval=20, group="CVD Momentum")
+momentum_tolerance = input.float(0.02, "Momentum Tolerance", minval=0.0, maxval=0.2, step=0.01, group="CVD Momentum")
+
+// ========== SIGNAL CONTROL (from indicator) ==========
+signal_cooldown = input.int(5, "Signal Cooldown (bars)", minval=0, maxval=50, group="Signal Control")
+
+// ========== VISUAL SETTINGS ==========
+show_swept_lines = input.bool(true, "Show Swept Level Lines", group="Visual")
+line_extend_bars = input.int(8, "Line Extension (bars past signal)", minval=2, maxval=30, group="Visual")
+show_debug = input.bool(false, "Show Debug Labels", group="Visual")
+bull_color = input.color(color.green, "Bullish Signal", group="Visual")
+bear_color = input.color(color.red, "Bearish Signal", group="Visual")
+level_line_color = input.color(color.new(#3179f5, 50), "Swept Level Line Color", group="Visual")
+
+// ========== CVD CALCULATION ==========
+upAndDownVolume() =>
+    posVol = 0.0
+    negVol = 0.0
+    var isBuyVolume = true
+    switch
+        close > open     => isBuyVolume := true
+        close < open     => isBuyVolume := false
+        close > close[1] => isBuyVolume := true
+        close < close[1] => isBuyVolume := false
+    if isBuyVolume
+        posVol += volume
+    else
+        negVol -= volume
+    posVol + negVol
+
+var lowerTimeframe = switch
+    use_custom_ltf      => cvd_ltf
+    timeframe.isseconds => "1S"
+    timeframe.isintraday => "1"
+    timeframe.isdaily   => "5"
+    => "60"
+
+diffVolArray = request.security_lower_tf(syminfo.tickerid, lowerTimeframe, upAndDownVolume())
+
+getHighLow(arr) =>
+    float cumVolume = na
+    float maxVolume = na
+    float minVolume = na
+    for item in arr
+        cumVolume := nz(cumVolume) + item
+        maxVolume := math.max(nz(maxVolume), cumVolume)
+        minVolume := math.min(nz(minVolume), cumVolume)
+    [maxVolume, minVolume, cumVolume]
+
+[maxVolume, minVolume, lastVolume] = getHighLow(diffVolArray)
+
+var cumulLastVolume = 0.0
+anchorChange = timeframe.change(cvd_anchor) or (not na(lastVolume) and na(lastVolume[1]))
+cumulOpenVolume = anchorChange ? 0.0 : cumulLastVolume[1]
+cumulLastVolume := cumulOpenVolume + lastVolume
+cvd_raw = cumulLastVolume
+cvd = ta.ema(cvd_raw, cvd_smooth)
+
+// ========== STRENGTH & MOMENTUM CALCULATION ==========
+cvd_highest = ta.highest(cvd, strength_period)
+cvd_lowest = ta.lowest(cvd, strength_period)
+cvd_range = math.max(cvd_highest - cvd_lowest, 1.0)
+cvd_momentum = cvd - cvd[momentum_bars]
+momentum_tol = cvd_range * momentum_tolerance
+
+// ========== ATR FOR RISK MANAGEMENT ==========
+atr_val = ta.atr(sl_atr_period)
+
+// ========== SWEEP THRESHOLD ==========
+sweep_threshold = sweep_ticks * syminfo.mintick
+
+// ========== SWING LEVEL TRACKING ==========
+price_pivot_high = ta.pivothigh(high, pivot_left, pivot_right)
+price_pivot_low = ta.pivotlow(low, pivot_left, pivot_right)
+
+var array<float> swing_hi_price = array.new<float>(0)
+var array<float> swing_hi_cvd = array.new<float>(0)
+var array<int> swing_hi_bar = array.new<int>(0)
+
+var array<float> swing_lo_price = array.new<float>(0)
+var array<float> swing_lo_cvd = array.new<float>(0)
+var array<int> swing_lo_bar = array.new<int>(0)
+
+if not na(price_pivot_high)
+    array.push(swing_hi_price, price_pivot_high)
+    array.push(swing_hi_cvd, cvd[pivot_right])
+    array.push(swing_hi_bar, bar_index - pivot_right)
+
+if not na(price_pivot_low)
+    array.push(swing_lo_price, price_pivot_low)
+    array.push(swing_lo_cvd, cvd[pivot_right])
+    array.push(swing_lo_bar, bar_index - pivot_right)
+
+// ========== PRUNE OLD LEVELS ==========
+if array.size(swing_hi_price) > 0
+    for i = array.size(swing_hi_price) - 1 to 0
+        if (bar_index - array.get(swing_hi_bar, i)) > max_level_age
+            array.remove(swing_hi_price, i)
+            array.remove(swing_hi_cvd, i)
+            array.remove(swing_hi_bar, i)
+
+if array.size(swing_lo_price) > 0
+    for i = array.size(swing_lo_price) - 1 to 0
+        if (bar_index - array.get(swing_lo_bar, i)) > max_level_age
+            array.remove(swing_lo_price, i)
+            array.remove(swing_lo_cvd, i)
+            array.remove(swing_lo_bar, i)
+
+while array.size(swing_hi_price) > 30
+    array.shift(swing_hi_price)
+    array.shift(swing_hi_cvd)
+    array.shift(swing_hi_bar)
+
+while array.size(swing_lo_price) > 30
+    array.shift(swing_lo_price)
+    array.shift(swing_lo_cvd)
+    array.shift(swing_lo_bar)
+
+// ========== LIQUIDITY SWEEP + DIVERGENCE DETECTION ==========
+var int last_bear_bar = -9999
+var int last_bull_bar = -9999
+
+bearish_divergence = false
+bullish_divergence = false
+
+var float bear_strength_out = 0.0
+var float bull_strength_out = 0.0
+var float bear_dbg_price = na
+var float bear_dbg_cvd = na
+var float bear_dbg_swept_price = na
+var float bear_dbg_momentum = na
+var int bear_swept_origin_bar = na
+var float bear_swept_cvd_val = na
+
+var float bull_dbg_price = na
+var float bull_dbg_cvd = na
+var float bull_dbg_swept_price = na
+var float bull_dbg_momentum = na
+var int bull_swept_origin_bar = na
+var float bull_swept_cvd_val = na
+
+// Store swept level for SL placement
+var float last_bull_swept_level = na
+var float last_bear_swept_level = na
+
+// --- BEARISH: Price sweeps above a prior swing high, CVD lower ---
+if array.size(swing_hi_price) > 0
+    array<int> consumed = array.new<int>(0)
+    float best_strength = 0.0
+    bool found = false
+    float f_swept_price = na
+    float f_swept_cvd = na
+    int f_swept_bar = na
+
+    bool momentum_ok = use_momentum_filter ? (cvd_momentum <= momentum_tol) : true
+
+    for i = 0 to array.size(swing_hi_price) - 1
+        sh_price = array.get(swing_hi_price, i)
+        sh_cvd = array.get(swing_hi_cvd, i)
+        sh_bar = array.get(swing_hi_bar, i)
+
+        if high > sh_price + sweep_threshold
+            array.push(consumed, i)
+
+            if cvd < sh_cvd and momentum_ok
+                div_magnitude = math.abs(cvd - sh_cvd)
+                this_strength = math.min(div_magnitude / cvd_range, 1.0)
+
+                if this_strength > best_strength
+                    best_strength := this_strength
+                    found := true
+                    f_swept_price := sh_price
+                    f_swept_cvd := sh_cvd
+                    f_swept_bar := sh_bar
+
+    if array.size(consumed) > 0
+        for i = array.size(consumed) - 1 to 0
+            idx = array.get(consumed, i)
+            array.remove(swing_hi_price, idx)
+            array.remove(swing_hi_cvd, idx)
+            array.remove(swing_hi_bar, idx)
+
+    if found and best_strength >= min_strength and (bar_index - last_bear_bar) >= signal_cooldown
+        bearish_divergence := true
+        bear_strength_out := best_strength
+        bear_dbg_price := high
+        bear_dbg_cvd := cvd
+        bear_dbg_swept_price := f_swept_price
+        bear_dbg_momentum := cvd_momentum
+        bear_swept_origin_bar := f_swept_bar
+        bear_swept_cvd_val := f_swept_cvd
+        last_bear_swept_level := f_swept_price
+        last_bear_bar := bar_index
+
+// --- BULLISH: Price sweeps below a prior swing low, CVD higher ---
+if array.size(swing_lo_price) > 0
+    array<int> consumed = array.new<int>(0)
+    float best_strength = 0.0
+    bool found = false
+    float f_swept_price = na
+    float f_swept_cvd = na
+    int f_swept_bar = na
+
+    bool momentum_ok = use_momentum_filter ? (cvd_momentum >= -momentum_tol) : true
+
+    for i = 0 to array.size(swing_lo_price) - 1
+        sl_price = array.get(swing_lo_price, i)
+        sl_cvd = array.get(swing_lo_cvd, i)
+        sl_bar = array.get(swing_lo_bar, i)
+
+        if low < sl_price - sweep_threshold
+            array.push(consumed, i)
+
+            if cvd > sl_cvd and momentum_ok
+                div_magnitude = math.abs(cvd - sl_cvd)
+                this_strength = math.min(div_magnitude / cvd_range, 1.0)
+
+                if this_strength > best_strength
+                    best_strength := this_strength
+                    found := true
+                    f_swept_price := sl_price
+                    f_swept_cvd := sl_cvd
+                    f_swept_bar := sl_bar
+
+    if array.size(consumed) > 0
+        for i = array.size(consumed) - 1 to 0
+            idx = array.get(consumed, i)
+            array.remove(swing_lo_price, idx)
+            array.remove(swing_lo_cvd, idx)
+            array.remove(swing_lo_bar, idx)
+
+    if found and best_strength >= min_strength and (bar_index - last_bull_bar) >= signal_cooldown
+        bullish_divergence := true
+        bull_strength_out := best_strength
+        bull_dbg_price := low
+        bull_dbg_cvd := cvd
+        bull_dbg_swept_price := f_swept_price
+        bull_dbg_momentum := cvd_momentum
+        bull_swept_origin_bar := f_swept_bar
+        bull_swept_cvd_val := f_swept_cvd
+        last_bull_swept_level := f_swept_price
+        last_bull_bar := bar_index
+
+// ========== SESSION FILTER ==========
+in_session = use_session_filter ? not na(time(timeframe.period, session_start)) : true
+
+// ========== MAX DRAWDOWN CHECK ==========
+var float peak_equity = strategy.initial_capital
+peak_equity := math.max(peak_equity, strategy.equity)
+current_dd_pct = (peak_equity - strategy.equity) / peak_equity * 100
+dd_ok = use_max_dd ? current_dd_pct < max_dd_pct : true
+
+// ========== DAILY LOSS LIMIT ==========
+var float day_start_equity = strategy.initial_capital
+if ta.change(time("D"))
+    day_start_equity := strategy.equity
+daily_loss = (day_start_equity - strategy.equity) / day_start_equity * 100
+daily_ok = use_daily_loss_limit ? daily_loss < daily_loss_pct : true
+
+// ========== CALCULATE STOP LOSS DISTANCE ==========
+calc_sl_distance() =>
+    float sl_dist = na
+    if use_stop_loss
+        if sl_mode == "Fixed Points"
+            sl_dist := sl_points
+        else if sl_mode == "Percentage"
+            sl_dist := close * sl_percent / 100
+        else if sl_mode == "ATR"
+            sl_dist := atr_val * sl_atr_mult
+        else if sl_mode == "Swept Level"
+            sl_dist := na  // handled per-signal
+    sl_dist
+
+sl_distance = calc_sl_distance()
+
+// ========== CALCULATE TAKE PROFIT DISTANCE ==========
+calc_tp_distance(float _sl_dist) =>
+    float tp_dist = na
+    if use_take_profit
+        if tp_mode == "Fixed Points"
+            tp_dist := tp_points
+        else if tp_mode == "Percentage"
+            tp_dist := close * tp_percent / 100
+        else if tp_mode == "ATR"
+            tp_dist := atr_val * tp_atr_mult
+        else if tp_mode == "Risk:Reward"
+            tp_dist := nz(_sl_dist, atr_val * 2) * tp_rr_ratio
+    tp_dist
+
+// ========== CALCULATE TRAILING STOP DISTANCE ==========
+calc_trail_distance() =>
+    float tr_dist = na
+    if use_trailing
+        if trail_mode == "Fixed Points"
+            tr_dist := trail_points
+        else if trail_mode == "Percentage"
+            tr_dist := close * trail_percent / 100
+        else if trail_mode == "ATR"
+            tr_dist := atr_val * trail_atr_mult
+    tr_dist
+
+trail_distance = calc_trail_distance()
+
+// ========== POSITION SIZING ==========
+calc_qty(float _sl_dist) =>
+    float qty = na
+    if position_mode == "Percent of Equity"
+        qty := math.floor(strategy.equity * (equity_pct / 100) / close)
+    else if position_mode == "Fixed Contracts"
+        qty := fixed_qty
+    else if position_mode == "Risk Per Trade"
+        if not na(_sl_dist) and _sl_dist > 0
+            risk_amount = strategy.equity * (risk_pct / 100)
+            qty := math.floor(risk_amount / (_sl_dist * syminfo.pointvalue))
+        else
+            qty := math.floor(strategy.equity * 0.02 / close)
+    math.max(qty, 1)
+
+// ========== TRADE TRACKING FOR BREAK-EVEN ==========
+var float entry_price = na
+var int entry_bar = na
+
+if strategy.position_size != 0 and strategy.position_size[1] == 0
+    entry_price := strategy.opentrades.entry_price(0)
+    entry_bar := bar_index
+if strategy.position_size == 0
+    entry_price := na
+    entry_bar := na
+
+// ========== ENTRY LOGIC ==========
+can_trade = in_session and dd_ok and daily_ok
+
+// --- LONG ENTRY ---
+if bullish_divergence and allow_longs and can_trade and strategy.position_size <= 0
+    // Close existing short
+    if strategy.position_size < 0
+        strategy.close("Short", comment="Close Short → Long")
+
+    // Calculate SL for this specific signal
+    float this_sl_dist = sl_distance
+    if use_stop_loss and sl_mode == "Swept Level" and not na(last_bull_swept_level)
+        this_sl_dist := close - last_bull_swept_level + sl_swept_offset * syminfo.mintick
+
+    tp_distance = calc_tp_distance(this_sl_dist)
+    qty = calc_qty(this_sl_dist)
+
+    float sl_price = na
+    float tp_price = na
+    if use_stop_loss and not na(this_sl_dist)
+        sl_price := close - this_sl_dist
+    if use_take_profit and not na(tp_distance)
+        tp_price := close + tp_distance
+
+    strategy.entry("Long", strategy.long, qty=qty)
+
+    if use_stop_loss and not na(sl_price)
+        if use_trailing and not na(trail_distance)
+            strategy.exit("Long Exit", "Long", stop=sl_price, limit=use_take_profit ? tp_price : na, trail_offset=math.round(trail_distance / syminfo.mintick), trail_points=math.round(trail_distance / syminfo.mintick))
+        else
+            strategy.exit("Long Exit", "Long", stop=sl_price, limit=use_take_profit ? tp_price : na)
+    else if use_take_profit and not na(tp_price)
+        strategy.exit("Long Exit", "Long", limit=tp_price)
+    else if use_trailing and not na(trail_distance)
+        strategy.exit("Long Exit", "Long", trail_offset=math.round(trail_distance / syminfo.mintick), trail_points=math.round(trail_distance / syminfo.mintick))
+
+// --- SHORT ENTRY ---
+if bearish_divergence and allow_shorts and can_trade and strategy.position_size >= 0
+    // Close existing long
+    if strategy.position_size > 0
+        strategy.close("Long", comment="Close Long → Short")
+
+    // Calculate SL for this specific signal
+    float this_sl_dist = sl_distance
+    if use_stop_loss and sl_mode == "Swept Level" and not na(last_bear_swept_level)
+        this_sl_dist := last_bear_swept_level - close + sl_swept_offset * syminfo.mintick
+
+    tp_distance = calc_tp_distance(this_sl_dist)
+    qty = calc_qty(this_sl_dist)
+
+    float sl_price = na
+    float tp_price = na
+    if use_stop_loss and not na(this_sl_dist)
+        sl_price := close + this_sl_dist
+    if use_take_profit and not na(tp_distance)
+        tp_price := close - tp_distance
+
+    strategy.entry("Short", strategy.short, qty=qty)
+
+    if use_stop_loss and not na(sl_price)
+        if use_trailing and not na(trail_distance)
+            strategy.exit("Short Exit", "Short", stop=sl_price, limit=use_take_profit ? tp_price : na, trail_offset=math.round(trail_distance / syminfo.mintick), trail_points=math.round(trail_distance / syminfo.mintick))
+        else
+            strategy.exit("Short Exit", "Short", stop=sl_price, limit=use_take_profit ? tp_price : na)
+    else if use_take_profit and not na(tp_price)
+        strategy.exit("Short Exit", "Short", limit=tp_price)
+    else if use_trailing and not na(trail_distance)
+        strategy.exit("Short Exit", "Short", trail_offset=math.round(trail_distance / syminfo.mintick), trail_points=math.round(trail_distance / syminfo.mintick))
+
+// ========== BREAK-EVEN LOGIC ==========
+if use_breakeven and strategy.position_size != 0 and not na(entry_price)
+    if strategy.position_size > 0
+        if high >= entry_price + be_trigger_points
+            be_price = entry_price + be_offset
+            strategy.exit("Long BE", "Long", stop=be_price)
+    if strategy.position_size < 0
+        if low <= entry_price - be_trigger_points
+            be_price = entry_price - be_offset
+            strategy.exit("Short BE", "Short", stop=be_price)
+
+// ========== MAX HOLD TIME EXIT ==========
+if use_max_hold and strategy.position_size != 0 and not na(entry_bar)
+    if (bar_index - entry_bar) >= max_hold_bars
+        if strategy.position_size > 0
+            strategy.close("Long", comment="Max Hold Exit")
+        else
+            strategy.close("Short", comment="Max Hold Exit")
+
+// ========== SESSION CLOSE EXIT ==========
+if close_at_session_end and use_session_filter
+    if not in_session and in_session[1]
+        if strategy.position_size > 0
+            strategy.close("Long", comment="Session Close")
+        if strategy.position_size < 0
+            strategy.close("Short", comment="Session Close")
+
+// ========== PLOTTING ==========
+plotshape(bullish_divergence and allow_longs and can_trade, "Bullish Entry", shape.triangleup, location.belowbar, bull_color, size=size.normal, text="LONG")
+plotshape(bearish_divergence and allow_shorts and can_trade, "Bearish Entry", shape.triangledown, location.abovebar, bear_color, size=size.normal, text="SHORT")
+
+// Swept level lines
+if show_swept_lines and bearish_divergence and not na(bear_swept_origin_bar)
+    line.new(bear_swept_origin_bar, bear_dbg_swept_price, bar_index + line_extend_bars, bear_dbg_swept_price, color=level_line_color, width=2, style=line.style_solid)
+if show_swept_lines and bullish_divergence and not na(bull_swept_origin_bar)
+    line.new(bull_swept_origin_bar, bull_dbg_swept_price, bar_index + line_extend_bars, bull_dbg_swept_price, color=level_line_color, width=2, style=line.style_solid)
+
+// Debug labels
+if show_debug and bearish_divergence
+    label.new(bar_index, bear_dbg_swept_price, "Sweep: " + str.tostring(bear_dbg_price, "#.##") + "\nLevel: " + str.tostring(bear_dbg_swept_price, "#.##") + "\nCVD: " + str.tostring(bear_dbg_cvd, "#") + "\nStr: " + str.tostring(bear_strength_out, "#.##") + "\nMom: " + str.tostring(bear_dbg_momentum, "#"), color=bear_color, textcolor=color.white, size=size.small, style=label.style_label_down)
+if show_debug and bullish_divergence
+    label.new(bar_index, bull_dbg_swept_price, "Sweep: " + str.tostring(bull_dbg_price, "#.##") + "\nLevel: " + str.tostring(bull_dbg_swept_price, "#.##") + "\nCVD: " + str.tostring(bull_dbg_cvd, "#") + "\nStr: " + str.tostring(bull_strength_out, "#.##") + "\nMom: " + str.tostring(bull_dbg_momentum, "#"), color=bull_color, textcolor=color.white, size=size.small, style=label.style_label_up)
+
+// Background
+bear_bg_alpha = bearish_divergence ? math.round(90 - bear_strength_out * 30) : 100
+bull_bg_alpha = bullish_divergence ? math.round(90 - bull_strength_out * 30) : 100
+bgcolor(bearish_divergence ? color.new(bear_color, bear_bg_alpha) : na)
+bgcolor(bullish_divergence ? color.new(bull_color, bull_bg_alpha) : na)
+
+// ========== STRATEGY INFO TABLE ==========
+var table info_table = table.new(position.top_right, 2, 8, bgcolor=color.new(color.black, 80), border_width=1)
+if barstate.islast
+    table.cell(info_table, 0, 0, "PHANTOM STRATEGY", text_color=color.white, text_size=size.small)
+    table.cell(info_table, 1, 0, "v1.0", text_color=color.gray, text_size=size.small)
+    table.cell(info_table, 0, 1, "Net P&L", text_color=color.gray, text_size=size.tiny)
+    table.cell(info_table, 1, 1, str.tostring(strategy.netprofit, "#.##"), text_color=strategy.netprofit >= 0 ? color.green : color.red, text_size=size.tiny)
+    table.cell(info_table, 0, 2, "Win Rate", text_color=color.gray, text_size=size.tiny)
+    wr = strategy.closedtrades > 0 ? strategy.wintrades / strategy.closedtrades * 100 : 0
+    table.cell(info_table, 1, 2, str.tostring(wr, "#.#") + "%", text_color=wr >= 50 ? color.green : color.orange, text_size=size.tiny)
+    table.cell(info_table, 0, 3, "Trades", text_color=color.gray, text_size=size.tiny)
+    table.cell(info_table, 1, 3, str.tostring(strategy.closedtrades), text_color=color.white, text_size=size.tiny)
+    table.cell(info_table, 0, 4, "Profit Factor", text_color=color.gray, text_size=size.tiny)
+    table.cell(info_table, 1, 4, str.tostring(strategy.grossprofit / math.max(math.abs(strategy.grossloss), 1), "#.##"), text_color=color.white, text_size=size.tiny)
+    table.cell(info_table, 0, 5, "Max DD", text_color=color.gray, text_size=size.tiny)
+    table.cell(info_table, 1, 5, str.tostring(strategy.max_drawdown, "#.##"), text_color=color.red, text_size=size.tiny)
+    table.cell(info_table, 0, 6, "Drawdown %", text_color=color.gray, text_size=size.tiny)
+    table.cell(info_table, 1, 6, str.tostring(current_dd_pct, "#.##") + "%", text_color=current_dd_pct > 3 ? color.red : color.white, text_size=size.tiny)
+    table.cell(info_table, 0, 7, "Direction", text_color=color.gray, text_size=size.tiny)
+    table.cell(info_table, 1, 7, trade_direction, text_color=color.white, text_size=size.tiny)
+
+// ========== ALERTS ==========
+alertcondition(bearish_divergence, "Bearish Signal", "PHANTOM: Short entry signal!")
+alertcondition(bullish_divergence, "Bullish Signal", "PHANTOM: Long entry signal!")
+alertcondition(bearish_divergence or bullish_divergence, "Any Signal", "PHANTOM: Trade signal!")

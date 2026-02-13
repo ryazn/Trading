@@ -1,0 +1,255 @@
+//@version=5
+indicator("PHANTOM CHART", overlay=true, max_bars_back=5000, max_lines_count=100)
+// ========================================
+// PHANTOM CVD Divergence v3.1
+// Architecture: Track swing levels → Detect liquidity sweeps → Check CVD divergence
+// Only signals when price genuinely sweeps past a prior swing by 1+ tick
+// AND CVD contradicts the move AND CVD momentum confirms the reversal direction
+// ========================================
+// ========== INPUTS ==========
+// CVD Settings
+cvd_anchor = input.timeframe("1D", "CVD Anchor Period", group="CVD Settings")
+use_custom_ltf = input.bool(false, "Use Custom CVD Timeframe", group="CVD Settings")
+cvd_ltf = input.timeframe("1", "CVD Lower Timeframe", group="CVD Settings")
+cvd_smooth = input.int(1, "CVD Smoothing (EMA)", minval=1, maxval=20, group="CVD Settings", tooltip="Lower = more responsive to volume changes")
+// Swing Level Detection
+pivot_left = input.int(10, "Pivot Left Bars", minval=2, maxval=50, group="Swing Detection", tooltip="Bars to left - defines how significant a swing level must be")
+pivot_right = input.int(1, "Pivot Right Bars", minval=1, maxval=10, group="Swing Detection", tooltip="Bars to right for confirmation")
+max_level_age = input.int(200, "Max Swing Level Age (bars)", minval=20, maxval=1000, group="Swing Detection", tooltip="Discard swing levels older than this many bars")
+// Sweep Settings
+sweep_ticks = input.int(1, "Sweep Threshold (ticks past level)", minval=1, maxval=10, group="Sweep Detection", tooltip="Price must exceed the swing level by at least this many ticks to count as a sweep")
+// Strength Filter
+min_strength = input.float(0.5, "Min Divergence Strength", minval=0.0, maxval=1.0, step=0.05, group="Strength Filter", tooltip="0 = all signals, higher = only clearer CVD contradictions")
+strength_period = input.int(50, "Strength Lookback Period", minval=10, maxval=200, group="Strength Filter", tooltip="Period for CVD range normalization")
+// CVD Momentum Confirmation
+use_momentum_filter = input.bool(false, "Require CVD Momentum Confirmation", group="CVD Momentum", tooltip="CVD must be moving in the reversal direction at the sweep, filters out sweeps where CVD is still trending with price")
+momentum_bars = input.int(5, "Momentum Lookback (bars)", minval=2, maxval=20, group="CVD Momentum", tooltip="Bars to measure CVD direction, lower = stricter, only fires when CVD has clearly turned")
+momentum_tolerance = input.float(0.02, "Momentum Tolerance", minval=0.0, maxval=0.2, step=0.01, group="CVD Momentum", tooltip="Allow signals where CVD is nearly flat, 0 = strict, higher = allows flat CVD, fraction of CVD range")
+// Signal Control
+signal_cooldown = input.int(5, "Signal Cooldown (bars)", minval=0, maxval=50, group="Signal Control", tooltip="Minimum bars between same-type signals, kept low since sweep logic naturally filters")
+// Visual Settings
+show_swept_lines = input.bool(true, "Show Swept Level Lines", group="Visual", tooltip="Draw horizontal lines at the price level that was swept")
+line_extend_bars = input.int(8, "Line Extension (bars past signal)", minval=2, maxval=30, group="Visual", tooltip="How far the swept level line extends past the signal bar")
+show_debug = input.bool(false, "Show Debug Labels", group="Visual", tooltip="Show labels with price, CVD, strength, and momentum at signals")
+bull_color = input.color(color.green, "Bullish Signal", group="Visual")
+bear_color = input.color(color.red, "Bearish Signal", group="Visual")
+level_line_color = input.color(color.new(#3179f5, 50), "Swept Level Line Color", group="Visual")
+// ========== CVD CALCULATION ==========
+upAndDownVolume() =>
+    posVol = 0.0
+    negVol = 0.0
+    var isBuyVolume = true
+    switch
+        close > open     => isBuyVolume := true
+        close < open     => isBuyVolume := false
+        close > close[1] => isBuyVolume := true
+        close < close[1] => isBuyVolume := false
+    if isBuyVolume
+        posVol += volume
+    else
+        negVol -= volume
+    posVol + negVol
+var lowerTimeframe = switch
+    use_custom_ltf      => cvd_ltf
+    timeframe.isseconds => "1S"
+    timeframe.isintraday => "1"
+    timeframe.isdaily   => "5"
+    => "60"
+diffVolArray = request.security_lower_tf(syminfo.tickerid, lowerTimeframe, upAndDownVolume())
+getHighLow(arr) =>
+    float cumVolume = na
+    float maxVolume = na
+    float minVolume = na
+    for item in arr
+        cumVolume := nz(cumVolume) + item
+        maxVolume := math.max(nz(maxVolume), cumVolume)
+        minVolume := math.min(nz(minVolume), cumVolume)
+    [maxVolume, minVolume, cumVolume]
+[maxVolume, minVolume, lastVolume] = getHighLow(diffVolArray)
+var cumulLastVolume = 0.0
+anchorChange = timeframe.change(cvd_anchor) or (not na(lastVolume) and na(lastVolume[1]))
+cumulOpenVolume = anchorChange ? 0.0 : cumulLastVolume[1]
+cumulLastVolume := cumulOpenVolume + lastVolume
+cvd_raw = cumulLastVolume
+cvd = ta.ema(cvd_raw, cvd_smooth)
+// ========== STRENGTH & MOMENTUM CALCULATION ==========
+cvd_highest = ta.highest(cvd, strength_period)
+cvd_lowest = ta.lowest(cvd, strength_period)
+cvd_range = math.max(cvd_highest - cvd_lowest, 1.0)
+cvd_momentum = cvd - cvd[momentum_bars]
+momentum_tol = cvd_range * momentum_tolerance
+// ========== SWEEP THRESHOLD ==========
+sweep_threshold = sweep_ticks * syminfo.mintick
+// ========== SWING LEVEL TRACKING ==========
+price_pivot_high = ta.pivothigh(high, pivot_left, pivot_right)
+price_pivot_low = ta.pivotlow(low, pivot_left, pivot_right)
+var array<float> swing_hi_price = array.new<float>(0)
+var array<float> swing_hi_cvd = array.new<float>(0)
+var array<int> swing_hi_bar = array.new<int>(0)
+var array<float> swing_lo_price = array.new<float>(0)
+var array<float> swing_lo_cvd = array.new<float>(0)
+var array<int> swing_lo_bar = array.new<int>(0)
+if not na(price_pivot_high)
+    array.push(swing_hi_price, price_pivot_high)
+    array.push(swing_hi_cvd, cvd[pivot_right])
+    array.push(swing_hi_bar, bar_index - pivot_right)
+if not na(price_pivot_low)
+    array.push(swing_lo_price, price_pivot_low)
+    array.push(swing_lo_cvd, cvd[pivot_right])
+    array.push(swing_lo_bar, bar_index - pivot_right)
+// ========== PRUNE OLD LEVELS ==========
+if array.size(swing_hi_price) > 0
+    for i = array.size(swing_hi_price) - 1 to 0
+        if (bar_index - array.get(swing_hi_bar, i)) > max_level_age
+            array.remove(swing_hi_price, i)
+            array.remove(swing_hi_cvd, i)
+            array.remove(swing_hi_bar, i)
+if array.size(swing_lo_price) > 0
+    for i = array.size(swing_lo_price) - 1 to 0
+        if (bar_index - array.get(swing_lo_bar, i)) > max_level_age
+            array.remove(swing_lo_price, i)
+            array.remove(swing_lo_cvd, i)
+            array.remove(swing_lo_bar, i)
+while array.size(swing_hi_price) > 30
+    array.shift(swing_hi_price)
+    array.shift(swing_hi_cvd)
+    array.shift(swing_hi_bar)
+while array.size(swing_lo_price) > 30
+    array.shift(swing_lo_price)
+    array.shift(swing_lo_cvd)
+    array.shift(swing_lo_bar)
+// ========== LIQUIDITY SWEEP + DIVERGENCE DETECTION ==========
+var int last_bear_bar = -9999
+var int last_bull_bar = -9999
+bearish_divergence = false
+bullish_divergence = false
+var float bear_strength_out = 0.0
+var float bull_strength_out = 0.0
+var float bear_dbg_price = na
+var float bear_dbg_cvd = na
+var float bear_dbg_swept_price = na
+var float bear_dbg_momentum = na
+var int bear_swept_origin_bar = na
+var float bear_swept_cvd_val = na
+var float bull_dbg_price = na
+var float bull_dbg_cvd = na
+var float bull_dbg_swept_price = na
+var float bull_dbg_momentum = na
+var int bull_swept_origin_bar = na
+var float bull_swept_cvd_val = na
+// --- BEARISH: Price sweeps above a prior swing high, CVD lower AND declining ---
+if array.size(swing_hi_price) > 0
+    array<int> consumed = array.new<int>(0)
+    float best_strength = 0.0
+    bool found = false
+    float f_swept_price = na
+    float f_swept_cvd = na
+    int f_swept_bar = na
+
+    bool momentum_ok = use_momentum_filter ? (cvd_momentum <= momentum_tol) : true
+
+    for i = 0 to array.size(swing_hi_price) - 1
+        sh_price = array.get(swing_hi_price, i)
+        sh_cvd = array.get(swing_hi_cvd, i)
+        sh_bar = array.get(swing_hi_bar, i)
+
+        if high > sh_price + sweep_threshold
+            array.push(consumed, i)
+
+            if cvd < sh_cvd and momentum_ok
+                div_magnitude = math.abs(cvd - sh_cvd)
+                this_strength = math.min(div_magnitude / cvd_range, 1.0)
+
+                if this_strength > best_strength
+                    best_strength := this_strength
+                    found := true
+                    f_swept_price := sh_price
+                    f_swept_cvd := sh_cvd
+                    f_swept_bar := sh_bar
+
+    if array.size(consumed) > 0
+        for i = array.size(consumed) - 1 to 0
+            idx = array.get(consumed, i)
+            array.remove(swing_hi_price, idx)
+            array.remove(swing_hi_cvd, idx)
+            array.remove(swing_hi_bar, idx)
+
+    if found and best_strength >= min_strength and (bar_index - last_bear_bar) >= signal_cooldown
+        bearish_divergence := true
+        bear_strength_out := best_strength
+        bear_dbg_price := high
+        bear_dbg_cvd := cvd
+        bear_dbg_swept_price := f_swept_price
+        bear_dbg_momentum := cvd_momentum
+        bear_swept_origin_bar := f_swept_bar
+        bear_swept_cvd_val := f_swept_cvd
+        last_bear_bar := bar_index
+// --- BULLISH: Price sweeps below a prior swing low, CVD higher AND rising ---
+if array.size(swing_lo_price) > 0
+    array<int> consumed = array.new<int>(0)
+    float best_strength = 0.0
+    bool found = false
+    float f_swept_price = na
+    float f_swept_cvd = na
+    int f_swept_bar = na
+
+    bool momentum_ok = use_momentum_filter ? (cvd_momentum >= -momentum_tol) : true
+
+    for i = 0 to array.size(swing_lo_price) - 1
+        sl_price = array.get(swing_lo_price, i)
+        sl_cvd = array.get(swing_lo_cvd, i)
+        sl_bar = array.get(swing_lo_bar, i)
+
+        if low < sl_price - sweep_threshold
+            array.push(consumed, i)
+
+            if cvd > sl_cvd and momentum_ok
+                div_magnitude = math.abs(cvd - sl_cvd)
+                this_strength = math.min(div_magnitude / cvd_range, 1.0)
+
+                if this_strength > best_strength
+                    best_strength := this_strength
+                    found := true
+                    f_swept_price := sl_price
+                    f_swept_cvd := sl_cvd
+                    f_swept_bar := sl_bar
+
+    if array.size(consumed) > 0
+        for i = array.size(consumed) - 1 to 0
+            idx = array.get(consumed, i)
+            array.remove(swing_lo_price, idx)
+            array.remove(swing_lo_cvd, idx)
+            array.remove(swing_lo_bar, idx)
+
+    if found and best_strength >= min_strength and (bar_index - last_bull_bar) >= signal_cooldown
+        bullish_divergence := true
+        bull_strength_out := best_strength
+        bull_dbg_price := low
+        bull_dbg_cvd := cvd
+        bull_dbg_swept_price := f_swept_price
+        bull_dbg_momentum := cvd_momentum
+        bull_swept_origin_bar := f_swept_bar
+        bull_swept_cvd_val := f_swept_cvd
+        last_bull_bar := bar_index
+// ========== PLOTTING ==========
+plotshape(bearish_divergence, "Bearish Divergence", shape.triangledown, location.abovebar, bear_color, size=size.normal, text="BEAR")
+plotshape(bullish_divergence, "Bullish Divergence", shape.triangleup, location.belowbar, bull_color, size=size.normal, text="BULL")
+// Swept level lines - horizontal at the PRICE level that was swept, from swing bar to signal + extension
+if show_swept_lines and bearish_divergence and not na(bear_swept_origin_bar)
+    line.new(bear_swept_origin_bar, bear_dbg_swept_price, bar_index + line_extend_bars, bear_dbg_swept_price, color=level_line_color, width=2, style=line.style_solid)
+if show_swept_lines and bullish_divergence and not na(bull_swept_origin_bar)
+    line.new(bull_swept_origin_bar, bull_dbg_swept_price, bar_index + line_extend_bars, bull_dbg_swept_price, color=level_line_color, width=2, style=line.style_solid)
+// Debug labels positioned at the swept price level
+if show_debug and bearish_divergence
+    label.new(bar_index, bear_dbg_swept_price, "Sweep: " + str.tostring(bear_dbg_price, "#.##") + "\nLevel: " + str.tostring(bear_dbg_swept_price, "#.##") + "\nCVD: " + str.tostring(bear_dbg_cvd, "#") + "\nStr: " + str.tostring(bear_strength_out, "#.##") + "\nMom: " + str.tostring(bear_dbg_momentum, "#"), color=bear_color, textcolor=color.white, size=size.small, style=label.style_label_down)
+if show_debug and bullish_divergence
+    label.new(bar_index, bull_dbg_swept_price, "Sweep: " + str.tostring(bull_dbg_price, "#.##") + "\nLevel: " + str.tostring(bull_dbg_swept_price, "#.##") + "\nCVD: " + str.tostring(bull_dbg_cvd, "#") + "\nStr: " + str.tostring(bull_strength_out, "#.##") + "\nMom: " + str.tostring(bull_dbg_momentum, "#"), color=bull_color, textcolor=color.white, size=size.small, style=label.style_label_up)
+// Background
+bear_bg_alpha = bearish_divergence ? math.round(90 - bear_strength_out * 30) : 100
+bull_bg_alpha = bullish_divergence ? math.round(90 - bull_strength_out * 30) : 100
+bgcolor(bearish_divergence ? color.new(bear_color, bear_bg_alpha) : na)
+bgcolor(bullish_divergence ? color.new(bull_color, bull_bg_alpha) : na)
+// ========== ALERTS ==========
+alertcondition(bearish_divergence, "Bearish Divergence", "PHANTOM: ES swept high with CVD divergence!")
+alertcondition(bullish_divergence, "Bullish Divergence", "PHANTOM: ES swept low with CVD divergence!")
+alertcondition(bearish_divergence or bullish_divergence, "Any Divergence", "PHANTOM: Liquidity sweep + CVD divergence!")

@@ -1,0 +1,109 @@
+# ================================================
+# PHANTOM CVD Strategy Configuration
+# ================================================
+# Edit this file to tune strategy and risk parameters.
+# Then run: python run_backtest.py --config config/phantom_config.yaml
+
+# --- Data Settings ---
+data:
+  # source: "csv", "yfinance", or "sample"
+  source: "sample"
+  # For CSV: path to OHLCV file
+  csv_path: "data/ES_1min.csv"
+  # For yfinance: ticker and period
+  symbol: "ES=F"
+  period: "5d"
+  interval: "1m"
+  # For sample data generation
+  sample_bars: 5000
+  sample_start_price: 5000.0
+  sample_volatility: 0.001
+
+# --- Strategy Parameters ---
+strategy:
+  # CVD
+  cvd_smooth: 1
+  cvd_anchor_bars: 390        # 1 day of 1-min bars (6.5h * 60)
+  # Swing Detection
+  pivot_left: 10
+  pivot_right: 1
+  max_level_age: 200
+  max_levels: 30
+  # Sweep Detection
+  sweep_ticks: 1
+  tick_size: 0.25             # ES futures tick size
+  # Strength Filter
+  min_strength: 0.5
+  strength_period: 50
+  # CVD Momentum
+  use_momentum_filter: false
+  momentum_bars: 5
+  momentum_tolerance: 0.02
+  # Signal Control
+  signal_cooldown: 5
+  # Direction
+  allow_longs: true
+  allow_shorts: true
+
+# --- Risk Management ---
+risk:
+  initial_capital: 100000.0
+
+  # Position Sizing: "percent_equity", "fixed_contracts", "risk_per_trade"
+  position_mode: "risk_per_trade"
+  equity_pct: 100.0
+  fixed_contracts: 1
+  risk_pct: 1.0
+
+  # Stop Loss: "fixed_points", "percentage", "atr", "swept_level"
+  use_stop_loss: true
+  sl_mode: "atr"
+  sl_fixed_points: 20.0
+  sl_percentage: 1.0
+  sl_atr_mult: 2.0
+  sl_atr_period: 14
+  sl_swept_offset_ticks: 2.0
+
+  # Take Profit: "fixed_points", "percentage", "atr", "risk_reward"
+  use_take_profit: true
+  tp_mode: "risk_reward"
+  tp_fixed_points: 40.0
+  tp_percentage: 2.0
+  tp_atr_mult: 3.0
+  tp_rr_ratio: 2.0
+
+  # Trailing Stop: "fixed_points", "percentage", "atr"
+  use_trailing: false
+  trail_mode: "atr"
+  trail_fixed_points: 15.0
+  trail_percentage: 1.0
+  trail_atr_mult: 1.5
+
+  # Break Even
+  use_breakeven: false
+  be_trigger_points: 15.0
+  be_offset: 1.0
+
+  # Session Filter
+  use_session_filter: false
+  session_start_hour: 9
+  session_start_minute: 30
+  session_end_hour: 16
+  session_end_minute: 0
+  close_at_session_end: false
+
+  # Risk Limits
+  use_max_drawdown: false
+  max_drawdown_pct: 5.0
+  use_daily_loss_limit: false
+  daily_loss_pct: 2.0
+
+  # Time Exit
+  use_max_hold: false
+  max_hold_bars: 50
+
+  # Costs (ES Micro = $1.24 per side, ES Full = $2.04 per side)
+  commission_per_contract: 1.24
+  slippage_ticks: 1
+  tick_size: 0.25
+  point_value: 50.0           # ES = $50/pt, MES = $5/pt, NQ = $20/pt
