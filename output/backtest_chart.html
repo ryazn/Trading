@@ -120,8 +120,10 @@ charts.push(cvdChart);
     });
   });
 
-  // Fit content
-  priceChart.timeScale().fitContent();
+  // Show last ~500 bars initially (about half a trading day) so candles are visible
+  var totalBars = candleData.length;
+  var visibleBars = Math.min(500, totalBars);
+  priceChart.timeScale().setVisibleLogicalRange({ from: totalBars - visibleBars, to: totalBars });
 
   // Resize handler
   window.addEventListener("resize", () => {
