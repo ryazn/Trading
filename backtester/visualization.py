@@ -30,10 +30,9 @@ class BacktestChart:
     - Performance dashboard (Plotly)
     """
 
-    TV_DARK_BG = "#121825"
-    TV_GRID = "#f0f3fa00"  # #f0f3fa at 0% opacity (hidden)
-    TV_TEXT = "#b2b5be"
-    TV_CANDLE = "rgba(255, 235, 59, 0.75)"  # #ffeb3b at 75% opacity
+    TV_DARK_BG = "#131722"
+    TV_GRID = "#1e222d"
+    TV_TEXT = "#d1d4dc"
     TV_GREEN = "#26a69a"
     TV_RED = "#ef5350"
     TV_BLUE = "#2196f3"
@@ -277,7 +276,6 @@ class BacktestChart:
         TEXT = self.TV_TEXT
         GREEN = self.TV_GREEN
         RED = self.TV_RED
-        CANDLE = self.TV_CANDLE
         SCALE_COLOR = "#b2b5be"
 
         return (
@@ -326,13 +324,10 @@ class BacktestChart:
             '    { ...commonOpts, height: document.getElementById("price-pane").clientHeight }\n'
             '  );\n'
             '  const candleSeries = priceChart.addSeries(LightweightCharts.CandlestickSeries, {\n'
-            '    upColor: "' + CANDLE + '",\n'
-            '    downColor: "' + CANDLE + '",\n'
-            '    borderVisible: true,\n'
-            '    borderUpColor: "' + CANDLE + '",\n'
-            '    borderDownColor: "' + CANDLE + '",\n'
-            '    wickUpColor: "' + CANDLE + '",\n'
-            '    wickDownColor: "' + CANDLE + '",\n'
+            '    upColor: "' + GREEN + '",\n'
+            '    downColor: "' + RED + '",\n'
+            '    wickUpColor: "' + GREEN + '",\n'
+            '    wickDownColor: "' + RED + '",\n'
             '  });\n'
             '  candleSeries.setData(candleData);\n'
             '\n'
