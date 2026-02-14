@@ -9,6 +9,8 @@ into yearly CSV files small enough for regular Git (no LFS needed).
 """
 
 import pandas as pd
+import zstandard as zstd
+import io
 import os
 import sys
 
@@ -17,14 +19,20 @@ def main():
     src = "data/glbx-mdp3-20100606-20260212.ohlcv-1m.csv.zst"
 
     if not os.path.exists(src):
-        print(f"ERROR: File not found: {src}")
+        print("ERROR: File not found: {}".format(src))
         print("Make sure you run this from the Trading repo root directory.")
         sys.exit(1)
 
-    print(f"Reading {src} (this may take a minute)...")
-    df = pd.read_csv(src, compression="zstd")
+    print("Reading {} (this may take a minute)...".format(src))
+
+    # Manually decompress zstd then read CSV (works with all pandas versions)
+    with open(src, "rb") as f:
+        dctx = zstd.ZstdDecompressor()
+        decompressed = dctx.decompress(f.read(), max_output_size=2 * 1024 * 1024 * 1024)
+    df = pd.read_csv(io.BytesIO(decompressed))
+    del decompressed  # free memory
     df.columns = [c.strip().lower() for c in df.columns]
-    print(f"  Loaded {len(df):,} rows")
+    print("  Loaded {:,} rows".format(len(df)))
 
     # Convert nanosecond timestamps to datetime
     if "ts_event" in df.columns:
@@ -47,8 +55,8 @@ def main():
     df = df[keep]
     df = df.sort_index()
 
-    print(f"  Date range: {df.index[0]} to {df.index[-1]}")
-    print(f"  Columns: {list(df.columns)}")
+    print("  Date range: {} to {}".format(df.index[0], df.index[-1]))
+    print("  Columns: {}".format(list(df.columns)))
 
     # Split by year and save
     os.makedirs("data/es_1min", exist_ok=True)
@@ -58,17 +66,17 @@ def main():
         chunk = df[df.index.year == year]
         if len(chunk) == 0:
             continue
-        outpath = f"data/es_1min/ES_{year}.csv"
+        outpath = "data/es_1min/ES_{}.csv".format(year)
         chunk.to_csv(outpath)
         size_mb = os.path.getsize(outpath) / 1e6
-        print(f"  Saved {outpath}: {len(chunk):,} bars ({size_mb:.1f} MB)")
+        print("  Saved {}: {:,} bars ({:.1f} MB)".format(outpath, len(chunk), size_mb))
 
     # Also save a combined file for quick loading
     combined = "data/es_1min_all.csv"
-    print(f"\nSaving combined file: {combined} ...")
+    print("\nSaving combined file: {} ...".format(combined))
     df.to_csv(combined)
     size_mb = os.path.getsize(combined) / 1e6
-    print(f"  Total: {len(df):,} bars ({size_mb:.1f} MB)")
+    print("  Total: {:,} bars ({:.1f} MB)".format(len(df), size_mb))
 
     print("\nDone! Now run:")
     print("  git add data/es_1min/ data/es_1min_all.csv")
