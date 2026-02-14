@@ -50,6 +50,7 @@ def main():
     parser = argparse.ArgumentParser(description="PHANTOM Strategy Optimizer")
     parser.add_argument("--csv", type=str, help="Path to CSV data file")
     parser.add_argument("--csv-dir", type=str, help="Directory of yearly CSV files (e.g. data/es_1min)")
+    parser.add_argument("--min-price", type=float, default=1000.0, help="Price floor filter for multi-contract data (default: 1000)")
     parser.add_argument("--sample", type=int, default=0, help="Generate N bars of sample data")
     args = parser.parse_args()
 
@@ -57,7 +58,7 @@ def main():
 
     if args.csv_dir:
         print(f"Loading CSV files from {args.csv_dir}...")
-        data = loader.load_directory(args.csv_dir)
+        data = loader.load_directory(args.csv_dir, min_price=args.min_price)
     elif args.csv:
         print(f"Loading {args.csv}...")
         data = loader.load_csv(args.csv)

@@ -116,6 +116,7 @@ def main():
     parser.add_argument("--config", type=str, help="Path to YAML config file")
     parser.add_argument("--csv", type=str, help="Path to CSV data file")
     parser.add_argument("--csv-dir", type=str, help="Directory of yearly CSV files (e.g. data/es_1min)")
+    parser.add_argument("--min-price", type=float, default=1000.0, help="Price floor filter for multi-contract data (default: 1000)")
     parser.add_argument("--symbol", type=str, help="yfinance ticker symbol")
     parser.add_argument("--period", type=str, default="5d", help="yfinance period")
     parser.add_argument("--interval", type=str, default="1m", help="yfinance interval")
@@ -143,7 +144,7 @@ def main():
 
     if args.csv_dir:
         print(f"\nLoading CSV files from {args.csv_dir}...")
-        data = loader.load_directory(args.csv_dir)
+        data = loader.load_directory(args.csv_dir, min_price=args.min_price)
     elif args.csv:
         print(f"\nLoading CSV data from {args.csv}...")
         data = loader.load_csv(args.csv)
