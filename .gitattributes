@@ -1,0 +1,2 @@
+# Track large Databento files with Git LFS
+*.dbn.zst filter=lfs diff=lfs merge=lfs -text
