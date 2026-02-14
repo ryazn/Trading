@@ -14,6 +14,7 @@ Usage:
 
 import sys
 import argparse
+import pandas as pd
 from pathlib import Path
 
 # Add project root to path
@@ -204,13 +205,19 @@ def main():
         print("\nGenerating charts...")
         chart = BacktestChart(data, report, engine.signals)
 
-        # Main backtest chart
+        # Main backtest chart - last 2 weeks only for easy comparison with TradingView
+        two_weeks_ago = data.index[-1] - pd.Timedelta(weeks=2)
+        start_idx = data.index.searchsorted(two_weeks_ago)
+        bar_range_2w = (start_idx, len(data))
+        print(f"  Chart showing last 2 weeks: bars {start_idx} to {len(data)} ({len(data) - start_idx} bars)")
+
         fig = chart.plot_backtest(
-            title="PHANTOM CVD Strategy Backtest",
+            title="PHANTOM CVD Strategy Backtest (Last 2 Weeks)",
             show_volume=True,
             show_equity=True,
             show_cvd=True,
             cvd_values=strategy.cvd,
+            bar_range=bar_range_2w,
             save_path=str(output_dir / "backtest_chart.html"),
         )
 
