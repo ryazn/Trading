@@ -1,8 +1,10 @@
 """
-TradingView-inspired chart visualization for backtests.
-Uses Plotly for interactive candlestick charts with trade overlays.
+TradingView-style chart visualization for backtests.
+Uses TradingView Lightweight Charts (v5) for the main backtest chart
+and Plotly for the performance dashboard.
 """
 
+import json
 import numpy as np
 import pandas as pd
 from typing import Optional
@@ -20,12 +22,12 @@ class BacktestChart:
     Generate TradingView-style interactive charts for backtest results.
 
     Features:
-    - Candlestick price chart
+    - Candlestick price chart (TradingView Lightweight Charts)
     - Volume bars (colored by direction)
     - Trade entry/exit markers
-    - Stop loss and take profit lines
     - Equity curve
     - CVD subplot (optional)
+    - Performance dashboard (Plotly)
     """
 
     TV_DARK_BG = "#131722"
@@ -38,15 +40,6 @@ class BacktestChart:
     TV_PURPLE = "#ab47bc"
 
     def __init__(self, data: pd.DataFrame, report=None, signals: Optional[list] = None):
-        """
-        Args:
-            data: OHLCV DataFrame with datetime index
-            report: PerformanceReport instance
-            signals: List of signal dicts from the engine
-        """
-        if not HAS_PLOTLY:
-            raise ImportError("plotly is required for visualization: pip install plotly")
-
         self.data = data
         self.report = report
         self.signals = signals or []
@@ -62,302 +55,359 @@ class BacktestChart:
         bar_range: Optional[tuple] = None,
         height: int = 900,
         save_path: Optional[str] = None,
-    ) -> go.Figure:
+    ) -> str:
         """
-        Create the full backtest chart.
+        Create a backtest chart using TradingView Lightweight Charts v5.
 
-        Args:
-            title: Chart title
-            show_volume: Show volume subplot
-            show_equity: Show equity curve subplot
-            show_cvd: Show CVD subplot
-            cvd_values: CVD array (same length as data)
-            bar_range: Tuple (start_idx, end_idx) to zoom into specific bars
-            height: Chart height in pixels
-            save_path: Path to save as HTML file
+        Returns the HTML string. Saves to file if save_path is provided.
         """
         df = self.data
+        offset = 0
         if bar_range:
+            offset = bar_range[0]
             df = df.iloc[bar_range[0]:bar_range[1]]
 
-        # Determine subplot layout
-        n_subplots = 1
-        row_heights = [0.6]
-        subplot_titles = ["Price"]
+        # Build candlestick data as list of {time, open, high, low, close}
+        candles = []
+        for ts, row in df.iterrows():
+            candles.append({
+                "time": int(ts.timestamp()),
+                "open": round(float(row["open"]), 2),
+                "high": round(float(row["high"]), 2),
+                "low": round(float(row["low"]), 2),
+                "close": round(float(row["close"]), 2),
+            })
 
+        # Build volume data
+        vol_data = []
         if show_volume:
-            n_subplots += 1
-            row_heights.append(0.1)
-            subplot_titles.append("Volume")
-        if show_equity and self.report:
-            n_subplots += 1
-            row_heights.append(0.15)
-            subplot_titles.append("Equity")
-        if show_cvd and cvd_values is not None:
-            n_subplots += 1
-            row_heights.append(0.15)
-            subplot_titles.append("CVD")
+            for ts, row in df.iterrows():
+                color = self.TV_GREEN if row["close"] >= row["open"] else self.TV_RED
+                vol_data.append({
+                    "time": int(ts.timestamp()),
+                    "value": int(row["volume"]),
+                    "color": color + "80",  # 50% opacity
+                })
 
-        fig = make_subplots(
-            rows=n_subplots,
-            cols=1,
-            shared_xaxes=True,
-            vertical_spacing=0.03,
-            row_heights=row_heights,
-            subplot_titles=subplot_titles,
-        )
-
-        # --- Candlestick Chart ---
-        fig.add_trace(
-            go.Candlestick(
-                x=df.index,
-                open=df["open"],
-                high=df["high"],
-                low=df["low"],
-                close=df["close"],
-                increasing_line_color=self.TV_GREEN,
-                decreasing_line_color=self.TV_RED,
-                increasing_fillcolor=self.TV_GREEN,
-                decreasing_fillcolor=self.TV_RED,
-                name="Price",
-            ),
-            row=1,
-            col=1,
-        )
-
-        # --- Trade Markers ---
-        self._add_trade_markers(fig, df, bar_range)
-
-        # --- Volume ---
-        current_row = 2
-        if show_volume:
-            colors = [
-                self.TV_GREEN if c >= o else self.TV_RED
-                for c, o in zip(df["close"], df["open"])
-            ]
-            fig.add_trace(
-                go.Bar(
-                    x=df.index,
-                    y=df["volume"],
-                    marker_color=colors,
-                    opacity=0.5,
-                    name="Volume",
-                    showlegend=False,
-                ),
-                row=current_row,
-                col=1,
-            )
-            current_row += 1
-
-        # --- Equity Curve ---
-        if show_equity and self.report:
-            ec = self.report.equity_curve
-            times = self.report.bar_times
-
-            if bar_range:
-                start_idx = max(0, bar_range[0] - 1)
-                end_idx = min(len(ec), bar_range[1] - 1)
-                ec = ec[start_idx:end_idx]
-                times = times[start_idx:end_idx]
-
-            fig.add_trace(
-                go.Scatter(
-                    x=times,
-                    y=ec,
-                    mode="lines",
-                    name="Equity",
-                    line=dict(color=self.TV_BLUE, width=1.5),
-                ),
-                row=current_row,
-                col=1,
-            )
-            current_row += 1
-
-        # --- CVD ---
-        if show_cvd and cvd_values is not None:
-            cvd_data = cvd_values
-            if bar_range:
-                cvd_data = cvd_values[bar_range[0]:bar_range[1]]
-
-            fig.add_trace(
-                go.Scatter(
-                    x=df.index,
-                    y=cvd_data[:len(df)],
-                    mode="lines",
-                    name="CVD",
-                    line=dict(color=self.TV_PURPLE, width=1.5),
-                ),
-                row=current_row,
-                col=1,
-            )
-
-        # --- Styling (TradingView dark theme) ---
-        fig.update_layout(
-            title=dict(
-                text=title,
-                font=dict(color=self.TV_TEXT, size=16),
-                x=0.5,
-            ),
-            template="plotly_dark",
-            paper_bgcolor=self.TV_DARK_BG,
-            plot_bgcolor=self.TV_DARK_BG,
-            font=dict(color=self.TV_TEXT, family="Trebuchet MS"),
-            height=height,
-            xaxis_rangeslider_visible=False,
-            showlegend=True,
-            legend=dict(
-                bgcolor="rgba(0,0,0,0.5)",
-                font=dict(size=10),
-            ),
-            hovermode="x unified",
-        )
-
-        # Style all axes
-        for i in range(1, n_subplots + 1):
-            fig.update_xaxes(
-                gridcolor=self.TV_GRID,
-                showgrid=True,
-                zeroline=False,
-                row=i,
-                col=1,
-            )
-            fig.update_yaxes(
-                gridcolor=self.TV_GRID,
-                showgrid=True,
-                zeroline=False,
-                row=i,
-                col=1,
-            )
-
-        if save_path:
-            fig.write_html(save_path)
-            print(f"Chart saved to {save_path}")
-
-        return fig
-
-    def _add_trade_markers(self, fig: go.Figure, df: pd.DataFrame, bar_range: Optional[tuple]):
-        """Add entry/exit markers and lines for trades."""
-        if not self.trades:
-            return
-
+        # Build trade markers
+        markers = []
         timestamps = df.index
-        offset = bar_range[0] if bar_range else 0
-
-        # Collect entry/exit points
-        long_entries_x, long_entries_y = [], []
-        short_entries_x, short_entries_y = [], []
-        win_exits_x, win_exits_y = [], []
-        loss_exits_x, loss_exits_y = [], []
-
         for trade in self.trades:
             entry_idx = trade.entry_bar - offset
             exit_idx = trade.exit_bar - offset
 
             if 0 <= entry_idx < len(timestamps):
+                entry_ts = int(timestamps[entry_idx].timestamp())
                 if trade.direction == 1:
-                    long_entries_x.append(timestamps[entry_idx])
-                    long_entries_y.append(trade.entry_price)
+                    markers.append({
+                        "time": entry_ts,
+                        "position": "belowBar",
+                        "color": self.TV_GREEN,
+                        "shape": "arrowUp",
+                        "text": "L",
+                    })
                 else:
-                    short_entries_x.append(timestamps[entry_idx])
-                    short_entries_y.append(trade.entry_price)
+                    markers.append({
+                        "time": entry_ts,
+                        "position": "aboveBar",
+                        "color": self.TV_RED,
+                        "shape": "arrowDown",
+                        "text": "S",
+                    })
 
             if 0 <= exit_idx < len(timestamps):
+                exit_ts = int(timestamps[exit_idx].timestamp())
                 if trade.pnl > 0:
-                    win_exits_x.append(timestamps[exit_idx])
-                    win_exits_y.append(trade.exit_price)
+                    markers.append({
+                        "time": exit_ts,
+                        "position": "aboveBar" if trade.direction == 1 else "belowBar",
+                        "color": self.TV_GREEN,
+                        "shape": "circle",
+                        "text": f"+${trade.pnl:.0f}",
+                    })
                 else:
-                    loss_exits_x.append(timestamps[exit_idx])
-                    loss_exits_y.append(trade.exit_price)
+                    markers.append({
+                        "time": exit_ts,
+                        "position": "aboveBar" if trade.direction == 1 else "belowBar",
+                        "color": self.TV_RED,
+                        "shape": "circle",
+                        "text": f"-${abs(trade.pnl):.0f}",
+                    })
 
-        # Long entries
-        if long_entries_x:
-            fig.add_trace(
-                go.Scatter(
-                    x=long_entries_x,
-                    y=long_entries_y,
-                    mode="markers",
-                    marker=dict(
-                        symbol="triangle-up",
-                        size=12,
-                        color=self.TV_GREEN,
-                        line=dict(width=1, color="white"),
-                    ),
-                    name="Long Entry",
-                    text=["LONG" for _ in long_entries_x],
-                ),
-                row=1,
-                col=1,
+        # Sort markers by time (required by Lightweight Charts)
+        markers.sort(key=lambda m: m["time"])
+
+        # Build equity data
+        equity_data = []
+        if show_equity and self.report:
+            ec = self.report.equity_curve
+            times = self.report.bar_times
+            if bar_range:
+                start_idx = max(0, bar_range[0] - 1)
+                end_idx = min(len(ec), bar_range[1] - 1)
+                ec = ec[start_idx:end_idx]
+                times = times[start_idx:end_idx]
+            for t, v in zip(times, ec):
+                equity_data.append({
+                    "time": int(t.timestamp()),
+                    "value": round(float(v), 2),
+                })
+
+        # Build CVD data
+        cvd_data = []
+        if show_cvd and cvd_values is not None:
+            cvd_slice = cvd_values[bar_range[0]:bar_range[1]] if bar_range else cvd_values
+            for i, ts in enumerate(df.index):
+                if i < len(cvd_slice):
+                    cvd_data.append({
+                        "time": int(ts.timestamp()),
+                        "value": round(float(cvd_slice[i]), 2),
+                    })
+
+        # Count chart panes
+        n_panes = 1  # price always
+        if show_volume:
+            n_panes += 1
+        if equity_data:
+            n_panes += 1
+        if cvd_data:
+            n_panes += 1
+
+        html = self._build_lightweight_html(
+            title=title,
+            candles_json=json.dumps(candles),
+            vol_json=json.dumps(vol_data),
+            markers_json=json.dumps(markers),
+            equity_json=json.dumps(equity_data),
+            cvd_json=json.dumps(cvd_data),
+            height=height,
+            show_volume=show_volume,
+            show_equity=bool(equity_data),
+            show_cvd=bool(cvd_data),
+        )
+
+        if save_path:
+            with open(save_path, "w") as f:
+                f.write(html)
+            print(f"Chart saved to {save_path}")
+
+        return html
+
+    def _build_lightweight_html(
+        self,
+        title: str,
+        candles_json: str,
+        vol_json: str,
+        markers_json: str,
+        equity_json: str,
+        cvd_json: str,
+        height: int,
+        show_volume: bool,
+        show_equity: bool,
+        show_cvd: bool,
+    ) -> str:
+        # Calculate pane heights
+        sub_panes = []
+        if show_volume:
+            sub_panes.append(("volume", 15))
+        if show_equity:
+            sub_panes.append(("equity", 15))
+        if show_cvd:
+            sub_panes.append(("cvd", 15))
+
+        sub_total = sum(p[1] for p in sub_panes)
+        price_pct = 100 - sub_total
+
+        pane_divs = "".join(
+            '<div id="' + name + '-pane" class="chart-pane sub-pane" style="position:relative;">'
+            '<div class="pane-label">' + name.upper() + '</div></div>'
+            for name, _ in sub_panes
+        )
+
+        # Build optional JS sections
+        vol_js = ""
+        if show_volume:
+            vol_js = (
+                "const volChart = LightweightCharts.createChart("
+                "document.getElementById('volume-pane'),"
+                "{ ...commonOpts, height: document.getElementById('volume-pane').clientHeight }"
+                ");\n"
+                "const volSeries = volChart.addSeries(LightweightCharts.HistogramSeries, {"
+                "priceFormat: { type: 'volume' },"
+                "});\n"
+                "volSeries.setData(volData);\n"
+                "charts.push(volChart);\n"
             )
 
-        # Short entries
-        if short_entries_x:
-            fig.add_trace(
-                go.Scatter(
-                    x=short_entries_x,
-                    y=short_entries_y,
-                    mode="markers",
-                    marker=dict(
-                        symbol="triangle-down",
-                        size=12,
-                        color=self.TV_RED,
-                        line=dict(width=1, color="white"),
-                    ),
-                    name="Short Entry",
-                    text=["SHORT" for _ in short_entries_x],
-                ),
-                row=1,
-                col=1,
+        eq_js = ""
+        if show_equity:
+            eq_js = (
+                "const eqChart = LightweightCharts.createChart("
+                "document.getElementById('equity-pane'),"
+                "{ ...commonOpts, height: document.getElementById('equity-pane').clientHeight }"
+                ");\n"
+                "const eqSeries = eqChart.addSeries(LightweightCharts.LineSeries, {"
+                "color: '" + self.TV_BLUE + "', lineWidth: 2,"
+                "});\n"
+                "eqSeries.setData(equityData);\n"
+                "charts.push(eqChart);\n"
             )
 
-        # Winning exits
-        if win_exits_x:
-            fig.add_trace(
-                go.Scatter(
-                    x=win_exits_x,
-                    y=win_exits_y,
-                    mode="markers",
-                    marker=dict(
-                        symbol="diamond",
-                        size=8,
-                        color=self.TV_GREEN,
-                        line=dict(width=1, color="white"),
-                    ),
-                    name="Win Exit",
-                ),
-                row=1,
-                col=1,
+        cvd_js = ""
+        if show_cvd:
+            cvd_js = (
+                "const cvdChart = LightweightCharts.createChart("
+                "document.getElementById('cvd-pane'),"
+                "{ ...commonOpts, height: document.getElementById('cvd-pane').clientHeight }"
+                ");\n"
+                "const cvdSeries = cvdChart.addSeries(LightweightCharts.LineSeries, {"
+                "color: '" + self.TV_PURPLE + "', lineWidth: 2,"
+                "});\n"
+                "cvdSeries.setData(cvdData);\n"
+                "charts.push(cvdChart);\n"
             )
 
-        # Losing exits
-        if loss_exits_x:
-            fig.add_trace(
-                go.Scatter(
-                    x=loss_exits_x,
-                    y=loss_exits_y,
-                    mode="markers",
-                    marker=dict(
-                        symbol="diamond",
-                        size=8,
-                        color=self.TV_RED,
-                        line=dict(width=1, color="white"),
-                    ),
-                    name="Loss Exit",
-                ),
-                row=1,
-                col=1,
-            )
+        resize_vol = "volChart.applyOptions({ width: document.getElementById('volume-pane').clientWidth, height: document.getElementById('volume-pane').clientHeight });" if show_volume else ""
+        resize_eq = "eqChart.applyOptions({ width: document.getElementById('equity-pane').clientWidth, height: document.getElementById('equity-pane').clientHeight });" if show_equity else ""
+        resize_cvd = "cvdChart.applyOptions({ width: document.getElementById('cvd-pane').clientWidth, height: document.getElementById('cvd-pane').clientHeight });" if show_cvd else ""
+
+        BG = self.TV_DARK_BG
+        GRID = self.TV_GRID
+        TEXT = self.TV_TEXT
+        GREEN = self.TV_GREEN
+        RED = self.TV_RED
+
+        return (
+            '<!DOCTYPE html>\n<html>\n<head>\n<meta charset="utf-8">\n'
+            '<title>' + title + '</title>\n'
+            '<script src="https://unpkg.com/lightweight-charts@5.0.3/dist/lightweight-charts.standalone.production.js"></script>\n'
+            '<style>\n'
+            '  * { margin: 0; padding: 0; box-sizing: border-box; }\n'
+            '  body { background: ' + BG + '; color: ' + TEXT + '; font-family: "Trebuchet MS", sans-serif; overflow: hidden; }\n'
+            '  #header { padding: 8px 16px; font-size: 14px; color: ' + TEXT + '; background: ' + BG + '; border-bottom: 1px solid ' + GRID + '; }\n'
+            '  #header h1 { font-size: 16px; font-weight: 600; display: inline; }\n'
+            '  #header .stats { font-size: 12px; color: #787b86; margin-left: 16px; }\n'
+            '  .chart-pane { width: 100%; border-bottom: 1px solid ' + GRID + '; }\n'
+            '  #price-pane { height: ' + str(price_pct) + 'vh; }\n'
+            '  .sub-pane { height: 15vh; }\n'
+            '  .pane-label { position: absolute; top: 4px; left: 8px; font-size: 11px; color: #787b86; z-index: 10; pointer-events: none; }\n'
+            '</style>\n</head>\n<body>\n'
+            '<div id="header">\n  <h1>' + title + '</h1>\n'
+            '  <span class="stats" id="stats"></span>\n</div>\n'
+            '<div id="price-pane" class="chart-pane" style="position:relative;">\n'
+            '  <div class="pane-label">Price</div>\n</div>\n'
+            + pane_divs +
+            '\n<script>\n'
+            '(function() {\n'
+            '  const candleData = ' + candles_json + ';\n'
+            '  const volData = ' + vol_json + ';\n'
+            '  const markerData = ' + markers_json + ';\n'
+            '  const equityData = ' + equity_json + ';\n'
+            '  const cvdData = ' + cvd_json + ';\n'
+            '\n'
+            '  const BG = "' + BG + '";\n'
+            '  const GRID = "' + GRID + '";\n'
+            '  const TEXT = "' + TEXT + '";\n'
+            '\n'
+            '  const commonOpts = {\n'
+            '    layout: { background: { color: BG }, textColor: TEXT, fontFamily: "Trebuchet MS" },\n'
+            '    grid: { vertLines: { color: GRID }, horzLines: { color: GRID } },\n'
+            '    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },\n'
+            '    timeScale: { timeVisible: true, secondsVisible: false, borderColor: GRID },\n'
+            '    rightPriceScale: { borderColor: GRID },\n'
+            '  };\n'
+            '\n'
+            '  // --- Price Chart ---\n'
+            '  const priceChart = LightweightCharts.createChart(\n'
+            '    document.getElementById("price-pane"),\n'
+            '    { ...commonOpts, height: document.getElementById("price-pane").clientHeight }\n'
+            '  );\n'
+            '  const candleSeries = priceChart.addSeries(LightweightCharts.CandlestickSeries, {\n'
+            '    upColor: "' + GREEN + '",\n'
+            '    downColor: "' + RED + '",\n'
+            '    borderVisible: false,\n'
+            '    wickUpColor: "' + GREEN + '",\n'
+            '    wickDownColor: "' + RED + '",\n'
+            '  });\n'
+            '  candleSeries.setData(candleData);\n'
+            '\n'
+            '  // Markers\n'
+            '  if (markerData.length > 0) {\n'
+            '    LightweightCharts.createSeriesMarkers(candleSeries, markerData);\n'
+            '  }\n'
+            '\n'
+            '  // Stats in header\n'
+            '  if (candleData.length > 0) {\n'
+            '    const first = candleData[0];\n'
+            '    const last = candleData[candleData.length - 1];\n'
+            '    const d1 = new Date(first.time * 1000).toLocaleDateString();\n'
+            '    const d2 = new Date(last.time * 1000).toLocaleDateString();\n'
+            '    document.getElementById("stats").textContent =\n'
+            '      candleData.length.toLocaleString() + " bars | " + d1 + " \\u2014 " + d2 +\n'
+            '      " | " + markerData.filter(m => m.shape === "arrowUp" || m.shape === "arrowDown").length + " trades";\n'
+            '  }\n'
+            '\n'
+            '  const charts = [priceChart];\n'
+            '\n'
+            + vol_js + eq_js + cvd_js +
+            '\n'
+            '  // Sync all charts time scales\n'
+            '  function syncCharts(sourceChart) {\n'
+            '    const timeRange = sourceChart.timeScale().getVisibleLogicalRange();\n'
+            '    if (timeRange !== null) {\n'
+            '      charts.forEach(c => {\n'
+            '        if (c !== sourceChart) {\n'
+            '          c.timeScale().setVisibleLogicalRange(timeRange);\n'
+            '        }\n'
+            '      });\n'
+            '    }\n'
+            '  }\n'
+            '\n'
+            '  charts.forEach(chart => {\n'
+            '    chart.timeScale().subscribeVisibleLogicalRangeChange(() => syncCharts(chart));\n'
+            '  });\n'
+            '\n'
+            '  // Sync crosshair\n'
+            '  charts.forEach((chart, idx) => {\n'
+            '    chart.subscribeCrosshairMove(param => {\n'
+            '      if (!param || !param.time) return;\n'
+            '      charts.forEach((other, oidx) => {\n'
+            '        if (idx !== oidx) {\n'
+            '          other.setCrosshairPosition(undefined, undefined, other.timeScale());\n'
+            '        }\n'
+            '      });\n'
+            '    });\n'
+            '  });\n'
+            '\n'
+            '  // Fit content\n'
+            '  priceChart.timeScale().fitContent();\n'
+            '\n'
+            '  // Resize handler\n'
+            '  window.addEventListener("resize", () => {\n'
+            '    const pricePaneEl = document.getElementById("price-pane");\n'
+            '    priceChart.applyOptions({ width: pricePaneEl.clientWidth, height: pricePaneEl.clientHeight });\n'
+            '    ' + resize_vol + '\n'
+            '    ' + resize_eq + '\n'
+            '    ' + resize_cvd + '\n'
+            '  });\n'
+            '})();\n'
+            '</script>\n</body>\n</html>'
+        )
 
     def plot_performance_dashboard(
         self,
         save_path: Optional[str] = None,
-    ) -> go.Figure:
+    ) -> "go.Figure":
         """
-        Create a performance dashboard with:
+        Create a performance dashboard with Plotly:
         - Equity curve
         - Drawdown chart
         - P&L distribution
         - Win/Loss breakdown
         """
+        if not HAS_PLOTLY:
+            raise ImportError("plotly is required for the performance dashboard: pip install plotly")
+
         if not self.report or self.report.total_trades == 0:
             print("No trades to display.")
             return go.Figure()
