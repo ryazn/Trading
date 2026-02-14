@@ -96,14 +96,16 @@ def load_databento_data(file_bytes: bytes, filename: str) -> pd.DataFrame:
     """Load and cache Databento DBN data from uploaded file."""
     loader = DataLoader()
     import tempfile, os
-    suffix = ".dbn.zst" if ".dbn.zst" in filename else ".zst"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
+    # Preserve original filename so databento can detect encoding from extension
+    tmp_dir = tempfile.mkdtemp()
+    tmp_path = os.path.join(tmp_dir, filename)
+    with open(tmp_path, "wb") as f:
         f.write(file_bytes)
-        tmp_path = f.name
     try:
         data = loader.load_databento(tmp_path)
     finally:
         os.unlink(tmp_path)
+        os.rmdir(tmp_dir)
     return data
 
 
