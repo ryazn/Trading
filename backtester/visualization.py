@@ -33,7 +33,7 @@ class BacktestChart:
     TV_DARK_BG = "#121825"
     TV_GRID = "#f0f3fa00"  # #f0f3fa at 0% opacity (hidden)
     TV_TEXT = "#b2b5be"
-    TV_CANDLE = "#ffeb3bbf"  # #ffeb3b at 75% opacity
+    TV_CANDLE = "rgba(255, 235, 59, 0.75)"  # #ffeb3b at 75% opacity
     TV_GREEN = "#26a69a"
     TV_RED = "#ef5350"
     TV_BLUE = "#2196f3"

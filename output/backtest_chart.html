@@ -51,13 +51,13 @@
     { ...commonOpts, height: document.getElementById("price-pane").clientHeight }
   );
   const candleSeries = priceChart.addSeries(LightweightCharts.CandlestickSeries, {
-    upColor: "#ffeb3bbf",
-    downColor: "#ffeb3bbf",
+    upColor: "rgba(255, 235, 59, 0.75)",
+    downColor: "rgba(255, 235, 59, 0.75)",
     borderVisible: true,
-    borderUpColor: "#ffeb3bbf",
-    borderDownColor: "#ffeb3bbf",
-    wickUpColor: "#ffeb3bbf",
-    wickDownColor: "#ffeb3bbf",
+    borderUpColor: "rgba(255, 235, 59, 0.75)",
+    borderDownColor: "rgba(255, 235, 59, 0.75)",
+    wickUpColor: "rgba(255, 235, 59, 0.75)",
+    wickDownColor: "rgba(255, 235, 59, 0.75)",
   });
   candleSeries.setData(candleData);
 
