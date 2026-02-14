@@ -30,9 +30,10 @@ class BacktestChart:
     - Performance dashboard (Plotly)
     """
 
-    TV_DARK_BG = "#131722"
-    TV_GRID = "#1e222d"
-    TV_TEXT = "#d1d4dc"
+    TV_DARK_BG = "#121825"
+    TV_GRID = "#f0f3fa00"  # transparent grid
+    TV_TEXT = "#b2b5be"
+    TV_CANDLE = "rgba(255, 235, 59, 0.75)"  # yellow candles
     TV_GREEN = "#26a69a"
     TV_RED = "#ef5350"
     TV_BLUE = "#2196f3"
@@ -66,6 +67,13 @@ class BacktestChart:
         if bar_range:
             offset = bar_range[0]
             df = df.iloc[bar_range[0]:bar_range[1]]
+
+        # Deduplicate timestamps (multi-contract data may have overlapping bars).
+        # Keep the row with highest volume for each timestamp.
+        if df.index.duplicated().any():
+            df = df.sort_values("volume", ascending=False)
+            df = df[~df.index.duplicated(keep="first")]
+            df = df.sort_index()
 
         # Build candlestick data as list of {time, open, high, low, close}
         candles = []
@@ -137,7 +145,7 @@ class BacktestChart:
         # Sort markers by time (required by Lightweight Charts)
         markers.sort(key=lambda m: m["time"])
 
-        # Build equity data
+        # Build equity data (deduplicate timestamps, keep last value)
         equity_data = []
         if show_equity and self.report:
             ec = self.report.equity_curve
@@ -147,11 +155,17 @@ class BacktestChart:
                 end_idx = min(len(ec), bar_range[1] - 1)
                 ec = ec[start_idx:end_idx]
                 times = times[start_idx:end_idx]
+            seen_times = set()
+            eq_pairs = []
             for t, v in zip(times, ec):
-                equity_data.append({
-                    "time": int(t.timestamp()),
-                    "value": round(float(v), 2),
-                })
+                ts = int(t.timestamp())
+                eq_pairs.append((ts, round(float(v), 2)))
+            # Keep last occurrence per timestamp
+            deduped_eq = {}
+            for ts, v in eq_pairs:
+                deduped_eq[ts] = v
+            for ts in sorted(deduped_eq):
+                equity_data.append({"time": ts, "value": deduped_eq[ts]})
 
         # Build CVD data
         cvd_data = []
@@ -173,6 +187,31 @@ class BacktestChart:
         if cvd_data:
             n_panes += 1
 
+        # Build results summary data
+        results_data = {}
+        if self.report and self.report.total_trades > 0:
+            r = self.report
+            results_data = {
+                "net_profit": round(r.net_profit, 2),
+                "total_return_pct": round(r.total_return_pct, 2),
+                "total_trades": r.total_trades,
+                "win_rate": round(r.win_rate, 1),
+                "profit_factor": round(r.profit_factor, 2),
+                "max_drawdown_pct": round(r.max_drawdown_pct, 2),
+                "max_drawdown_abs": round(r.max_drawdown_abs, 2),
+                "sharpe_ratio": round(r.sharpe_ratio, 2),
+                "avg_trade": round(r.avg_trade, 2),
+                "avg_win": round(r.avg_win, 2),
+                "avg_loss": round(r.avg_loss, 2),
+                "winning_trades": r.winning_trades,
+                "losing_trades": r.losing_trades,
+                "long_trades": r.long_trades,
+                "short_trades": r.short_trades,
+                "expectancy": round(r.expectancy, 2),
+                "initial_capital": round(r.initial_capital, 2),
+                "final_equity": round(r.final_equity, 2),
+            }
+
         html = self._build_lightweight_html(
             title=title,
             candles_json=json.dumps(candles),
@@ -180,6 +219,7 @@ class BacktestChart:
             markers_json=json.dumps(markers),
             equity_json=json.dumps(equity_data),
             cvd_json=json.dumps(cvd_data),
+            results_json=json.dumps(results_data),
             height=height,
             show_volume=show_volume,
             show_equity=bool(equity_data),
@@ -201,6 +241,7 @@ class BacktestChart:
         markers_json: str,
         equity_json: str,
         cvd_json: str,
+        results_json: str,
         height: int,
         show_volume: bool,
         show_equity: bool,
@@ -276,6 +317,7 @@ class BacktestChart:
         TEXT = self.TV_TEXT
         GREEN = self.TV_GREEN
         RED = self.TV_RED
+        CANDLE = self.TV_CANDLE
         SCALE_COLOR = "#b2b5be"
 
         return (
@@ -292,9 +334,23 @@ class BacktestChart:
             '  #price-pane { height: ' + str(price_pct) + 'vh; }\n'
             '  .sub-pane { height: 15vh; }\n'
             '  .pane-label { position: absolute; top: 4px; left: 8px; font-size: 11px; color: #787b86; z-index: 10; pointer-events: none; }\n'
+            '  #results-toggle { position: fixed; top: 8px; right: 16px; z-index: 100; background: #2a2e39; border: 1px solid #363a45; color: ' + TEXT + '; padding: 4px 12px; border-radius: 4px; cursor: pointer; font-size: 12px; font-family: "Trebuchet MS", sans-serif; }\n'
+            '  #results-toggle:hover { background: #363a45; }\n'
+            '  #results-panel { position: fixed; top: 36px; right: 16px; z-index: 99; background: rgba(30,34,45,0.95); border: 1px solid #363a45; border-radius: 6px; padding: 12px 16px; font-size: 12px; color: ' + TEXT + '; min-width: 260px; max-height: 80vh; overflow-y: auto; display: none; }\n'
+            '  #results-panel.visible { display: block; }\n'
+            '  #results-panel h2 { font-size: 13px; font-weight: 600; margin-bottom: 8px; color: #fff; border-bottom: 1px solid #363a45; padding-bottom: 6px; }\n'
+            '  #results-panel .section { margin-bottom: 10px; }\n'
+            '  #results-panel .section-title { font-size: 11px; color: #787b86; text-transform: uppercase; margin-bottom: 4px; }\n'
+            '  #results-panel .row { display: flex; justify-content: space-between; padding: 2px 0; }\n'
+            '  #results-panel .label { color: #787b86; }\n'
+            '  #results-panel .value { font-weight: 500; }\n'
+            '  #results-panel .positive { color: ' + GREEN + '; }\n'
+            '  #results-panel .negative { color: ' + RED + '; }\n'
             '</style>\n</head>\n<body>\n'
             '<div id="header">\n  <h1>' + title + '</h1>\n'
             '  <span class="stats" id="stats"></span>\n</div>\n'
+            '<button id="results-toggle" onclick="document.getElementById(\'results-panel\').classList.toggle(\'visible\')">Results</button>\n'
+            '<div id="results-panel"></div>\n'
             '<div id="price-pane" class="chart-pane" style="position:relative;">\n'
             '  <div class="pane-label">Price</div>\n</div>\n'
             + pane_divs +
@@ -305,6 +361,38 @@ class BacktestChart:
             '  const markerData = ' + markers_json + ';\n'
             '  const equityData = ' + equity_json + ';\n'
             '  const cvdData = ' + cvd_json + ';\n'
+            '  const results = ' + results_json + ';\n'
+            '\n'
+            '  // Populate results panel\n'
+            '  if (results && results.total_trades) {\n'
+            '    const fmt = (v) => v.toLocaleString("en-US", {minimumFractionDigits: 2, maximumFractionDigits: 2});\n'
+            '    const cls = (v) => v >= 0 ? "positive" : "negative";\n'
+            '    const sign = (v) => v >= 0 ? "+" : "";\n'
+            '    document.getElementById("results-panel").innerHTML = \'<h2>Backtest Results</h2>\'\n'
+            '      + \'<div class="section"><div class="section-title">Overview</div>\'\n'
+            '      + \'<div class="row"><span class="label">Net Profit</span><span class="value \' + cls(results.net_profit) + \'">$\' + fmt(results.net_profit) + \' (\' + sign(results.total_return_pct) + results.total_return_pct.toFixed(2) + \'%)</span></div>\'\n'
+            '      + \'<div class="row"><span class="label">Initial Capital</span><span class="value">$\' + fmt(results.initial_capital) + \'</span></div>\'\n'
+            '      + \'<div class="row"><span class="label">Final Equity</span><span class="value">$\' + fmt(results.final_equity) + \'</span></div>\'\n'
+            '      + \'</div>\'\n'
+            '      + \'<div class="section"><div class="section-title">Trades</div>\'\n'
+            '      + \'<div class="row"><span class="label">Total Trades</span><span class="value">\' + results.total_trades + \'</span></div>\'\n'
+            '      + \'<div class="row"><span class="label">Win Rate</span><span class="value">\' + results.win_rate.toFixed(1) + \'%</span></div>\'\n'
+            '      + \'<div class="row"><span class="label">Winners / Losers</span><span class="value \' + cls(results.winning_trades - results.losing_trades) + \'">\' + results.winning_trades + \' / \' + results.losing_trades + \'</span></div>\'\n'
+            '      + \'<div class="row"><span class="label">Long / Short</span><span class="value">\' + results.long_trades + \' / \' + results.short_trades + \'</span></div>\'\n'
+            '      + \'</div>\'\n'
+            '      + \'<div class="section"><div class="section-title">Performance</div>\'\n'
+            '      + \'<div class="row"><span class="label">Profit Factor</span><span class="value">\' + results.profit_factor.toFixed(2) + \'</span></div>\'\n'
+            '      + \'<div class="row"><span class="label">Expectancy</span><span class="value \' + cls(results.expectancy) + \'">$\' + fmt(results.expectancy) + \'</span></div>\'\n'
+            '      + \'<div class="row"><span class="label">Avg Trade</span><span class="value \' + cls(results.avg_trade) + \'">$\' + fmt(results.avg_trade) + \'</span></div>\'\n'
+            '      + \'<div class="row"><span class="label">Avg Win</span><span class="value positive">$\' + fmt(results.avg_win) + \'</span></div>\'\n'
+            '      + \'<div class="row"><span class="label">Avg Loss</span><span class="value negative">$\' + fmt(results.avg_loss) + \'</span></div>\'\n'
+            '      + \'</div>\'\n'
+            '      + \'<div class="section"><div class="section-title">Risk</div>\'\n'
+            '      + \'<div class="row"><span class="label">Max Drawdown</span><span class="value negative">$\' + fmt(results.max_drawdown_abs) + \' (\' + results.max_drawdown_pct.toFixed(2) + \'%)</span></div>\'\n'
+            '      + \'<div class="row"><span class="label">Sharpe Ratio</span><span class="value">\' + results.sharpe_ratio.toFixed(2) + \'</span></div>\'\n'
+            '      + \'</div>\';\n'
+            '    document.getElementById("results-panel").classList.add("visible");\n'
+            '  }\n'
             '\n'
             '  const BG = "' + BG + '";\n'
             '  const GRID = "' + GRID + '";\n'
@@ -324,10 +412,13 @@ class BacktestChart:
             '    { ...commonOpts, height: document.getElementById("price-pane").clientHeight }\n'
             '  );\n'
             '  const candleSeries = priceChart.addSeries(LightweightCharts.CandlestickSeries, {\n'
-            '    upColor: "' + GREEN + '",\n'
-            '    downColor: "' + RED + '",\n'
-            '    wickUpColor: "' + GREEN + '",\n'
-            '    wickDownColor: "' + RED + '",\n'
+            '    upColor: "' + CANDLE + '",\n'
+            '    downColor: "' + CANDLE + '",\n'
+            '    borderVisible: true,\n'
+            '    borderUpColor: "' + CANDLE + '",\n'
+            '    borderDownColor: "' + CANDLE + '",\n'
+            '    wickUpColor: "' + CANDLE + '",\n'
+            '    wickDownColor: "' + CANDLE + '",\n'
             '  });\n'
             '  candleSeries.setData(candleData);\n'
             '\n'
