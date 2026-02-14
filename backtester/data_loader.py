@@ -94,6 +94,59 @@ class DataLoader:
         self._data = df
         return df
 
+    def load_directory(
+        self,
+        dirpath: str,
+        pattern: str = "*.csv",
+        min_price: float = 0.0,
+    ) -> pd.DataFrame:
+        """
+        Load and concatenate multiple CSV files from a directory.
+
+        Useful for yearly Databento CSV splits (ES_2010.csv, ES_2011.csv, ...).
+        Deduplicates by keeping the highest-volume row per timestamp
+        (front-month contract for futures with overlapping contract months).
+
+        Args:
+            min_price: Filter out bars with close below this price.
+                       Use to remove spread/micro contract data.
+                       For ES futures, 1000.0 is a safe floor.
+        """
+        import glob as _glob
+
+        files = sorted(_glob.glob(str(Path(dirpath) / pattern)))
+        if not files:
+            raise ValueError(f"No files matching '{pattern}' in {dirpath}")
+
+        dfs = []
+        for f in files:
+            loader = DataLoader()
+            dfs.append(loader.load_csv(f))
+
+        df = pd.concat(dfs)
+        df = df.sort_index()
+
+        # Filter out non-front-month data (spreads, micros) by price floor
+        if min_price > 0:
+            before = len(df)
+            df = df[df["close"] >= min_price]
+            removed = before - len(df)
+            if removed > 0:
+                print(f"  Price filter (>= {min_price}): removed {removed:,} bars")
+
+        # Deduplicate: keep highest-volume row per timestamp
+        # (front-month futures contract has more volume than back-month)
+        if df.index.duplicated().any():
+            before = len(df)
+            df = df.sort_values("volume", ascending=False).groupby(level=0).first()
+            df = df.sort_index()
+            after = len(df)
+            print(f"  Deduplicated: {before:,} → {after:,} bars "
+                  f"(removed {before - after:,} duplicate timestamps)")
+
+        self._data = df
+        return df
+
     def load_databento(self, filepath: str) -> pd.DataFrame:
         """
         Load OHLCV data from a Databento file (.csv.zst or .dbn.zst).

@@ -7,6 +7,7 @@ configuration on historical data.
 
 Usage:
     python optimize.py --csv "CME_MINI_ES1!, 1_6378e.csv"
+    python optimize.py --csv-dir data/es_1min
     python optimize.py --sample 10000
 """
 
@@ -48,12 +49,16 @@ def run_single(data, strategy_params, risk_config, initial_capital):
 def main():
     parser = argparse.ArgumentParser(description="PHANTOM Strategy Optimizer")
     parser.add_argument("--csv", type=str, help="Path to CSV data file")
+    parser.add_argument("--csv-dir", type=str, help="Directory of yearly CSV files (e.g. data/es_1min)")
     parser.add_argument("--sample", type=int, default=0, help="Generate N bars of sample data")
     args = parser.parse_args()
 
     loader = DataLoader()
 
-    if args.csv:
+    if args.csv_dir:
+        print(f"Loading CSV files from {args.csv_dir}...")
+        data = loader.load_directory(args.csv_dir)
+    elif args.csv:
         print(f"Loading {args.csv}...")
         data = loader.load_csv(args.csv)
     else:
