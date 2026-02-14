@@ -96,43 +96,75 @@ class DataLoader:
 
     def load_databento(self, filepath: str) -> pd.DataFrame:
         """
-        Load OHLCV data from a Databento DBN file (.dbn.zst).
+        Load OHLCV data from a Databento file (.csv.zst or .dbn.zst).
 
-        Supports Databento's OHLCV-1s, OHLCV-1m, and similar bar schemas.
-        Handles both fixed-point integer prices and pre-converted float prices.
+        Supports:
+        - CSV compressed with zstandard (.csv.zst) — uses pandas directly
+        - DBN compressed with zstandard (.dbn.zst) — uses databento library
+
+        Databento CSV columns: ts_event, open, high, low, close, volume, ...
         Timestamps are converted to US/Eastern for ES futures.
         """
-        try:
-            import databento as db
-        except ImportError:
-            raise ImportError("databento is required: pip install databento")
+        filepath_lower = filepath.lower()
 
-        store = db.DBNStore.from_file(filepath)
-        df = store.to_df()
+        if filepath_lower.endswith(".csv.zst") or filepath_lower.endswith(".csv"):
+            df = self._load_databento_csv(filepath)
+        elif filepath_lower.endswith(".dbn.zst") or filepath_lower.endswith(".dbn"):
+            df = self._load_databento_dbn(filepath)
+        else:
+            # Try CSV first, fall back to DBN
+            try:
+                df = self._load_databento_csv(filepath)
+            except Exception:
+                df = self._load_databento_dbn(filepath)
 
-        # Convert fixed-point integer prices to float if needed
-        # Databento stores prices as int64 in units of 1/1e9
-        price_cols = ["open", "high", "low", "close"]
-        for col in price_cols:
-            if col in df.columns and df[col].dtype in [np.int64, np.int32]:
-                df[col] = df[col] / 1_000_000_000
+        self._data = df
+        return df
 
-        # Handle datetime index (DBNStore.to_df() uses ts_event as index)
-        if hasattr(df.index, 'tz') and df.index.tz is not None:
-            df.index = df.index.tz_convert("US/Eastern").tz_localize(None)
-        elif df.index.dtype == np.int64 or df.index.dtype == np.uint64:
-            # Nanosecond unix timestamps
-            df.index = pd.to_datetime(df.index, unit="ns", utc=True)
-            df.index = df.index.tz_convert("US/Eastern").tz_localize(None)
+    def _load_databento_csv(self, filepath: str) -> pd.DataFrame:
+        """Load Databento CSV (.csv.zst) using pandas."""
+        compression = "zstd" if filepath.lower().endswith(".zst") else "infer"
+        df = pd.read_csv(filepath, compression=compression)
+        df.columns = [c.strip().lower() for c in df.columns]
 
+        # Find timestamp column
+        ts_col = None
+        for candidate in ["ts_event", "ts_recv", "timestamp", "datetime", "time"]:
+            if candidate in df.columns:
+                ts_col = candidate
+                break
+
+        if ts_col is None:
+            raise ValueError(f"No timestamp column found. Available: {list(df.columns)}")
+
+        # Databento ts_event is nanosecond unix timestamp
+        sample_val = df[ts_col].iloc[0]
+        if isinstance(sample_val, (int, float, np.integer, np.floating)) and sample_val > 1e15:
+            # Nanosecond timestamps
+            df[ts_col] = pd.to_datetime(df[ts_col], unit="ns", utc=True)
+            df[ts_col] = df[ts_col].dt.tz_convert("US/Eastern").dt.tz_localize(None)
+        elif isinstance(sample_val, (int, float, np.integer, np.floating)) and sample_val > 1e9:
+            # Second timestamps
+            df[ts_col] = pd.to_datetime(df[ts_col], unit="s", utc=True)
+            df[ts_col] = df[ts_col].dt.tz_convert("US/Eastern").dt.tz_localize(None)
+        else:
+            df[ts_col] = pd.to_datetime(df[ts_col])
+
+        df = df.set_index(ts_col)
         df.index.name = "datetime"
 
-        # Keep only relevant columns, drop DBN metadata
+        # Drop Databento metadata columns
         drop_cols = [
             "rtype", "publisher_id", "instrument_id", "ts_recv",
-            "flags", "sequence", "symbol",
+            "flags", "sequence", "symbol", "ts_event",
         ]
         df = df.drop(columns=[c for c in drop_cols if c in df.columns], errors="ignore")
+
+        # Validate OHLCV columns exist
+        price_cols = ["open", "high", "low", "close"]
+        missing = [c for c in price_cols if c not in df.columns]
+        if missing:
+            raise ValueError(f"Missing required columns: {missing}")
 
         # Ensure numeric types
         for col in df.columns:
@@ -143,8 +175,47 @@ class DataLoader:
 
         df = df.dropna(subset=price_cols)
         df = df.sort_index()
+        return df
 
-        self._data = df
+    def _load_databento_dbn(self, filepath: str) -> pd.DataFrame:
+        """Load Databento DBN (.dbn.zst) using databento library."""
+        try:
+            import databento as db
+        except ImportError:
+            raise ImportError("databento is required: pip install databento")
+
+        store = db.DBNStore.from_file(filepath)
+        df = store.to_df()
+
+        # Convert fixed-point integer prices to float if needed
+        price_cols = ["open", "high", "low", "close"]
+        for col in price_cols:
+            if col in df.columns and df[col].dtype in [np.int64, np.int32]:
+                df[col] = df[col] / 1_000_000_000
+
+        # Handle datetime index
+        if hasattr(df.index, 'tz') and df.index.tz is not None:
+            df.index = df.index.tz_convert("US/Eastern").tz_localize(None)
+        elif df.index.dtype == np.int64 or df.index.dtype == np.uint64:
+            df.index = pd.to_datetime(df.index, unit="ns", utc=True)
+            df.index = df.index.tz_convert("US/Eastern").tz_localize(None)
+
+        df.index.name = "datetime"
+
+        drop_cols = [
+            "rtype", "publisher_id", "instrument_id", "ts_recv",
+            "flags", "sequence", "symbol",
+        ]
+        df = df.drop(columns=[c for c in drop_cols if c in df.columns], errors="ignore")
+
+        for col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        if "volume" not in df.columns:
+            df["volume"] = 1000
+
+        df = df.dropna(subset=price_cols)
+        df = df.sort_index()
         return df
 
     def download(

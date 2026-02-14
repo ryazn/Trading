@@ -124,9 +124,9 @@ st.sidebar.markdown("---")
 
 st.sidebar.header("📁 Data")
 uploaded_file = st.sidebar.file_uploader(
-    "Upload data (CSV or Databento .dbn.zst)",
+    "Upload data (CSV, .csv.zst, or .dbn.zst)",
     type=["csv", "zst"],
-    help="Supports: standard OHLCV CSV, TradingView exports with CVD, Databento DBN files (.dbn.zst)"
+    help="Supports: standard OHLCV CSV, TradingView exports with CVD, Databento files (.csv.zst or .dbn.zst)"
 )
 
 use_sample = st.sidebar.checkbox("Use sample data instead", value=uploaded_file is None)
