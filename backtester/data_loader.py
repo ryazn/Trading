@@ -1,6 +1,6 @@
 """
 Data loader for backtesting engine.
-Supports CSV files and yfinance downloads for 1-min bar data.
+Supports CSV files, Databento DBN files, and yfinance downloads for 1-min bar data.
 """
 
 import pandas as pd
@@ -89,6 +89,59 @@ class DataLoader:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
 
         df = df.dropna(subset=self.REQUIRED_COLUMNS)
+        df = df.sort_index()
+
+        self._data = df
+        return df
+
+    def load_databento(self, filepath: str) -> pd.DataFrame:
+        """
+        Load OHLCV data from a Databento DBN file (.dbn.zst).
+
+        Supports Databento's OHLCV-1s, OHLCV-1m, and similar bar schemas.
+        Handles both fixed-point integer prices and pre-converted float prices.
+        Timestamps are converted to US/Eastern for ES futures.
+        """
+        try:
+            import databento as db
+        except ImportError:
+            raise ImportError("databento is required: pip install databento")
+
+        store = db.DBNStore.from_file(filepath)
+        df = store.to_df()
+
+        # Convert fixed-point integer prices to float if needed
+        # Databento stores prices as int64 in units of 1/1e9
+        price_cols = ["open", "high", "low", "close"]
+        for col in price_cols:
+            if col in df.columns and df[col].dtype in [np.int64, np.int32]:
+                df[col] = df[col] / 1_000_000_000
+
+        # Handle datetime index (DBNStore.to_df() uses ts_event as index)
+        if hasattr(df.index, 'tz') and df.index.tz is not None:
+            df.index = df.index.tz_convert("US/Eastern").tz_localize(None)
+        elif df.index.dtype == np.int64 or df.index.dtype == np.uint64:
+            # Nanosecond unix timestamps
+            df.index = pd.to_datetime(df.index, unit="ns", utc=True)
+            df.index = df.index.tz_convert("US/Eastern").tz_localize(None)
+
+        df.index.name = "datetime"
+
+        # Keep only relevant columns, drop DBN metadata
+        drop_cols = [
+            "rtype", "publisher_id", "instrument_id", "ts_recv",
+            "flags", "sequence", "symbol",
+        ]
+        df = df.drop(columns=[c for c in drop_cols if c in df.columns], errors="ignore")
+
+        # Ensure numeric types
+        for col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        if "volume" not in df.columns:
+            df["volume"] = 1000
+
+        df = df.dropna(subset=price_cols)
         df = df.sort_index()
 
         self._data = df

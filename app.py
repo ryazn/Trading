@@ -80,13 +80,28 @@ def color_pnl(val):
 def load_csv_data(file_bytes: bytes, filename: str) -> pd.DataFrame:
     """Load and cache CSV data from uploaded file."""
     loader = DataLoader()
-    # Write to temp file for loader
     import tempfile, os
     with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as f:
         f.write(file_bytes)
         tmp_path = f.name
     try:
         data = loader.load_csv(tmp_path)
+    finally:
+        os.unlink(tmp_path)
+    return data
+
+
+@st.cache_data
+def load_databento_data(file_bytes: bytes, filename: str) -> pd.DataFrame:
+    """Load and cache Databento DBN data from uploaded file."""
+    loader = DataLoader()
+    import tempfile, os
+    suffix = ".dbn.zst" if ".dbn.zst" in filename else ".zst"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
+        f.write(file_bytes)
+        tmp_path = f.name
+    try:
+        data = loader.load_databento(tmp_path)
     finally:
         os.unlink(tmp_path)
     return data
@@ -107,9 +122,9 @@ st.sidebar.markdown("---")
 
 st.sidebar.header("📁 Data")
 uploaded_file = st.sidebar.file_uploader(
-    "Upload CSV (OHLCV or TradingView export)",
-    type=["csv"],
-    help="Supports: standard OHLCV, TradingView exports with CVD, Databento OHLCV-1m"
+    "Upload data (CSV or Databento .dbn.zst)",
+    type=["csv", "zst"],
+    help="Supports: standard OHLCV CSV, TradingView exports with CVD, Databento DBN files (.dbn.zst)"
 )
 
 use_sample = st.sidebar.checkbox("Use sample data instead", value=uploaded_file is None)
@@ -296,11 +311,17 @@ st.title("👻 PHANTOM CVD Backtester")
 data = None
 if uploaded_file is not None and not use_sample:
     try:
-        data = load_csv_data(uploaded_file.getvalue(), uploaded_file.name)
-        st.success(f"Loaded **{len(data):,}** bars from `{uploaded_file.name}`  "
-                   f"({data.index[0]} → {data.index[-1]})")
+        fname = uploaded_file.name.lower()
+        if fname.endswith(".zst") or fname.endswith(".dbn.zst"):
+            data = load_databento_data(uploaded_file.getvalue(), uploaded_file.name)
+            st.success(f"Loaded **{len(data):,}** bars from Databento file `{uploaded_file.name}`  "
+                       f"({data.index[0]} → {data.index[-1]})")
+        else:
+            data = load_csv_data(uploaded_file.getvalue(), uploaded_file.name)
+            st.success(f"Loaded **{len(data):,}** bars from `{uploaded_file.name}`  "
+                       f"({data.index[0]} → {data.index[-1]})")
     except Exception as e:
-        st.error(f"Error loading CSV: {e}")
+        st.error(f"Error loading data: {e}")
 elif use_sample:
     loader = DataLoader()
     data = loader.generate_sample_data(bars=sample_bars)
