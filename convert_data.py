@@ -23,16 +23,32 @@ def main():
         print("Make sure you run this from the Trading repo root directory.")
         sys.exit(1)
 
+    # Check file size - if tiny, it's probably an LFS pointer
+    file_size = os.path.getsize(src)
+    print("File size: {:.1f} MB".format(file_size / 1e6))
+
+    if file_size < 1000:
+        with open(src, "r") as f:
+            content = f.read()
+        if "git-lfs" in content:
+            print("\nERROR: This file is a Git LFS pointer, not the actual data!")
+            print("The real file was replaced by LFS. Please re-copy the original:")
+            print('  copy "PATH_TO_DATABENTO_DOWNLOAD\\glbx-mdp3-20100606-20260212.ohlcv-1m.csv.zst" data\\')
+            sys.exit(1)
+        else:
+            print("File content: {}".format(content[:200]))
+            sys.exit(1)
+
     print("Reading {} (this may take a minute)...".format(src))
 
-    # Manually decompress zstd then read CSV (works with all pandas versions)
+    # Stream decompress for large files (works with all pandas/Python versions)
     with open(src, "rb") as f:
         dctx = zstd.ZstdDecompressor()
-        decompressed = dctx.decompress(f.read(), max_output_size=2 * 1024 * 1024 * 1024)
-    df = pd.read_csv(io.BytesIO(decompressed))
-    del decompressed  # free memory
+        reader = dctx.stream_reader(f)
+        df = pd.read_csv(reader)
     df.columns = [c.strip().lower() for c in df.columns]
     print("  Loaded {:,} rows".format(len(df)))
+    print("  Columns found: {}".format(list(df.columns)[:10]))
 
     # Convert nanosecond timestamps to datetime
     if "ts_event" in df.columns:
