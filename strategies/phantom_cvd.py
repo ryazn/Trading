@@ -93,6 +93,8 @@ class PhantomCVDStrategy(BaseStrategy):
             self._using_real_cvd = True
         else:
             # Estimate CVD from bar direction (close vs open)
+            # Matches PineScript: upAndDownVolume() classifies entire bar volume
+            # as buy or sell based on close vs open, with close[1] tiebreak.
             delta = np.zeros(n)
             for i in range(n):
                 if self.closes[i] > self.opens[i]:
@@ -107,12 +109,20 @@ class PhantomCVDStrategy(BaseStrategy):
                     else:
                         delta[i] = 0
 
-            anchor = p["cvd_anchor_bars"]
+            # Anchor CVD reset on actual day boundaries (matches PineScript
+            # timeframe.change("1D")). Falls back to bar-count anchor if
+            # no timestamp index is available.
+            timestamps = self.data.index if self.data is not None else None
             cvd_raw = np.zeros(n)
             cumulative = 0.0
             for i in range(n):
-                if anchor > 0 and i % anchor == 0:
-                    cumulative = 0.0
+                if timestamps is not None and i > 0:
+                    if timestamps[i].date() != timestamps[i - 1].date():
+                        cumulative = 0.0
+                elif timestamps is None:
+                    anchor = p["cvd_anchor_bars"]
+                    if anchor > 0 and i % anchor == 0:
+                        cumulative = 0.0
                 cumulative += delta[i]
                 cvd_raw[i] = cumulative
             self._using_real_cvd = False

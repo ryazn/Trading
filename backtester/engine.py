@@ -65,6 +65,11 @@ class BacktestEngine:
 
         n_bars = len(data)
 
+        # Pending signal: PineScript process_orders_on_close=false means
+        # strategy.entry() on bar N fills at bar N+1's open.
+        pending_signal = None
+        pending_atr = 0.0
+
         for i in range(1, n_bars):
             timestamp = timestamps[i]
             bar_open = opens[i]
@@ -80,6 +85,63 @@ class BacktestEngine:
                 lows[i - lookback:i + 1],
                 closes[i - lookback:i + 1],
             )
+
+            # --- Execute pending entry from previous bar's signal ---
+            # Matches PineScript: signal on bar N, fill at bar N+1 open
+            if pending_signal is not None:
+                sig_dir = pending_signal["direction"]
+                can_enter = self.risk_manager.can_trade(self.equity, timestamp)
+                has_position = self.risk_manager.position is not None
+
+                # Close opposite position if needed
+                if has_position and self.risk_manager.position.direction != sig_dir:
+                    close_trade = self.risk_manager.force_close(
+                        bar_open, i, "Reverse Signal", str(timestamp)
+                    )
+                    if close_trade is not None:
+                        self.equity += close_trade.pnl
+                        if verbose:
+                            direction = "LONG" if close_trade.direction == 1 else "SHORT"
+                            print(
+                                f"[{timestamp}] REVERSE CLOSE {direction} | "
+                                f"P&L: ${close_trade.pnl:.2f} | Equity: ${self.equity:.2f}"
+                            )
+                    has_position = False
+
+                # Enter new position at this bar's open
+                if not has_position and can_enter:
+                    swept_level = pending_signal.get("swept_level")
+                    pos = self.risk_manager.open_position(
+                        direction=sig_dir,
+                        entry_price=bar_open,
+                        bar_index=i,
+                        equity=self.equity,
+                        atr=pending_atr,
+                        swept_level=swept_level,
+                        timestamp=str(timestamp),
+                    )
+
+                    self.signals.append({
+                        "bar_index": i,
+                        "timestamp": timestamp,
+                        "direction": sig_dir,
+                        "price": bar_open,
+                        "strength": pending_signal.get("strength", 0),
+                        "swept_level": swept_level,
+                        "stop_loss": pos.stop_loss,
+                        "take_profit": pos.take_profit,
+                    })
+
+                    if verbose:
+                        direction = "LONG" if sig_dir == 1 else "SHORT"
+                        sl_str = f"{pos.stop_loss:.2f}" if pos.stop_loss else "None"
+                        tp_str = f"{pos.take_profit:.2f}" if pos.take_profit else "None"
+                        print(
+                            f"[{timestamp}] ENTER {direction} @ {pos.entry_price:.2f} | "
+                            f"Qty: {pos.quantity} | SL: {sl_str} | TP: {tp_str}"
+                        )
+
+                pending_signal = None
 
             # --- Update existing position ---
             trade = self.risk_manager.update_position(
@@ -102,62 +164,12 @@ class BacktestEngine:
                         f"Equity: ${self.equity:.2f}"
                     )
 
-            # --- Get strategy signal ---
+            # --- Get strategy signal (queued for next bar) ---
             signal = strategy.generate_signal(i)
 
             if signal is not None and signal["direction"] != 0:
-                can_enter = self.risk_manager.can_trade(self.equity, timestamp)
-                has_position = self.risk_manager.position is not None
-
-                sig_dir = signal["direction"]  # 1 = long, -1 = short
-
-                # Close opposite position if needed
-                if has_position and self.risk_manager.position.direction != sig_dir:
-                    close_trade = self.risk_manager.force_close(
-                        bar_close, i, "Reverse Signal", str(timestamp)
-                    )
-                    if close_trade is not None:
-                        self.equity += close_trade.pnl
-                        if verbose:
-                            direction = "LONG" if close_trade.direction == 1 else "SHORT"
-                            print(
-                                f"[{timestamp}] REVERSE CLOSE {direction} | "
-                                f"P&L: ${close_trade.pnl:.2f} | Equity: ${self.equity:.2f}"
-                            )
-                    has_position = False
-
-                # Enter new position
-                if not has_position and can_enter:
-                    swept_level = signal.get("swept_level")
-                    pos = self.risk_manager.open_position(
-                        direction=sig_dir,
-                        entry_price=bar_close,
-                        bar_index=i,
-                        equity=self.equity,
-                        atr=atr,
-                        swept_level=swept_level,
-                        timestamp=str(timestamp),
-                    )
-
-                    self.signals.append({
-                        "bar_index": i,
-                        "timestamp": timestamp,
-                        "direction": sig_dir,
-                        "price": bar_close,
-                        "strength": signal.get("strength", 0),
-                        "swept_level": swept_level,
-                        "stop_loss": pos.stop_loss,
-                        "take_profit": pos.take_profit,
-                    })
-
-                    if verbose:
-                        direction = "LONG" if sig_dir == 1 else "SHORT"
-                        sl_str = f"{pos.stop_loss:.2f}" if pos.stop_loss else "None"
-                        tp_str = f"{pos.take_profit:.2f}" if pos.take_profit else "None"
-                        print(
-                            f"[{timestamp}] ENTER {direction} @ {pos.entry_price:.2f} | "
-                            f"Qty: {pos.quantity} | SL: {sl_str} | TP: {tp_str}"
-                        )
+                pending_signal = signal
+                pending_atr = atr
 
             # Track equity
             # Mark-to-market: include unrealized P&L

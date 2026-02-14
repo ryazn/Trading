@@ -148,7 +148,7 @@ def main():
         data = loader.load_directory(args.csv_dir, min_price=args.min_price)
     elif args.csv:
         print(f"\nLoading CSV data from {args.csv}...")
-        data = loader.load_csv(args.csv)
+        data = loader.load_csv(args.csv, min_price=args.min_price)
     elif args.symbol:
         print(f"\nDownloading {args.symbol} ({args.interval}) via yfinance...")
         data = loader.download(args.symbol, period=args.period, interval=args.interval)
@@ -158,7 +158,7 @@ def main():
     elif data_cfg.get("source") == "csv":
         csv_path = data_cfg.get("csv_path", "data/ES_1min.csv")
         print(f"\nLoading CSV data from {csv_path}...")
-        data = loader.load_csv(csv_path)
+        data = loader.load_csv(csv_path, min_price=args.min_price)
     elif data_cfg.get("source") == "yfinance":
         symbol = data_cfg.get("symbol", "ES=F")
         print(f"\nDownloading {symbol} via yfinance...")

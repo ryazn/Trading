@@ -30,6 +30,7 @@ class DataLoader:
         datetime_col: str = "datetime",
         datetime_format: Optional[str] = None,
         separator: str = ",",
+        min_price: float = 0.0,
     ) -> pd.DataFrame:
         """
         Load OHLCV data from a CSV file.
@@ -40,6 +41,11 @@ class DataLoader:
 
         Columns are case-insensitive (will be lowercased).
         Extra columns (cvd, bullish entry, bearish entry) are preserved.
+
+        Args:
+            min_price: Filter out bars with close below this price.
+                       Use to remove spread/micro contract data.
+                       For ES futures, 1000.0 is a safe floor.
         """
         df = pd.read_csv(filepath, sep=separator)
         df.columns = [c.strip().lower() for c in df.columns]
@@ -90,6 +96,25 @@ class DataLoader:
 
         df = df.dropna(subset=self.REQUIRED_COLUMNS)
         df = df.sort_index()
+
+        # Filter out non-front-month data (spreads, micros) by price floor
+        if min_price > 0:
+            before = len(df)
+            df = df[df["close"] >= min_price]
+            removed = before - len(df)
+            if removed > 0:
+                print(f"  Price filter (>= {min_price}): removed {removed:,} bars")
+
+        # Deduplicate: keep highest-volume row per timestamp
+        # (front-month futures contract has more volume than back-month)
+        if df.index.duplicated().any():
+            before = len(df)
+            df = df.sort_values("volume", ascending=False)
+            df = df[~df.index.duplicated(keep="first")]
+            df = df.sort_index()
+            after = len(df)
+            print(f"  Deduplicated: {before:,} → {after:,} bars "
+                  f"(removed {before - after:,} duplicate timestamps)")
 
         self._data = df
         return df
