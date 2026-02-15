@@ -7,29 +7,18 @@ strategy("PHANTOM STRATEGY", overlay=true, max_bars_back=5000, max_lines_count=1
      currency=currency.USD)
 
 // ========================================
-// PHANTOM CVD Divergence Strategy v2.0
-// Optimized via 5-year sensitivity analysis (2021-2025)
+// PHANTOM CVD Divergence Strategy v2.1
+// Sweep Quality Filters Edition
 //
-// Key finding: min_strength=0.6 is the single most impactful parameter.
-// It filters out ~75% of weak CVD divergences, keeping only high-conviction signals.
+// v2.1 adds three sweep quality filters that let us lower min_strength
+// from 0.6 to 0.3, capturing more good signals while filtering bad ones:
 //
-// 5-Year Results (Config B):
-//   Net P&L:  +$10,875 (+10.87%)
-//   Trades:   228 (46/year)
-//   Win Rate: 46.1%
-//   PF:       1.28
-//   Max DD:   6.96%
-//   Sharpe:   0.23
+//   1. Sweep Rejection — bar must close back past the level (wick, not breakout)
+//   2. Max Sweep Distance — rejects sweeps that penetrate too far (breakouts)
+//   3. Approach Momentum — requires directional move into the level before sweep
 //
-// Removed inputs with no/negative impact:
-//   - CVD smoothing (smoothing hurt — raw CVD is best)
-//   - CVD momentum filter (hurt when combined with strength filter)
-//   - Trailing stop, break-even, max hold time
-//   - Max drawdown / daily loss limit stops
-//   - Multiple SL modes (ATR is the winner)
-//   - Multiple TP modes (Risk:Reward is the winner)
-//   - Multiple position sizing modes (Fixed Contracts is cleanest)
-//   - Custom CVD timeframe
+// These filters target the structural quality of the sweep itself,
+// rather than relying solely on CVD divergence magnitude.
 // ========================================
 
 // ========== STRATEGY DIRECTION ==========
@@ -61,10 +50,17 @@ pivot_right = input.int(1, "Pivot Right Bars", minval=1, maxval=10, group="Swing
 max_level_age = input.int(100, "Max Swing Level Age (bars)", minval=20, maxval=1000, group="Swing Detection")
 
 // ========== SWEEP DETECTION ==========
-sweep_ticks = input.int(2, "Sweep Threshold (ticks past level)", minval=1, maxval=10, group="Sweep Detection")
+sweep_ticks = input.int(2, "Min Sweep (ticks past level)", minval=1, maxval=10, group="Sweep Detection", tooltip="Minimum penetration to count as a sweep")
+
+// ========== SWEEP QUALITY FILTERS ==========
+use_rejection = input.bool(true, "Require Sweep Rejection", group="Sweep Quality", tooltip="Sweep bar must close back past the level — wick through, not breakout. This is the key filter for clean liquidity grabs.")
+max_sweep_ticks = input.int(8, "Max Sweep Distance (ticks)", minval=2, maxval=50, group="Sweep Quality", tooltip="Reject sweeps that penetrate too far past the level (likely genuine breakouts, not liquidity grabs)")
+use_approach = input.bool(true, "Require Approach Momentum", group="Sweep Quality", tooltip="Price must have made a directional move toward the level before the sweep, filtering out choppy sideways grinds into levels")
+approach_bars = input.int(5, "Approach Lookback (bars)", minval=2, maxval=20, group="Sweep Quality")
+approach_min_atr = input.float(0.5, "Min Approach Move (ATR mult)", minval=0.1, maxval=3.0, step=0.1, group="Sweep Quality", tooltip="Minimum directional move into the level, measured in ATR multiples")
 
 // ========== STRENGTH FILTER ==========
-min_strength = input.float(0.6, "Min Divergence Strength", minval=0.0, maxval=1.0, step=0.05, group="Strength Filter", tooltip="0.6 filters out ~75% of weak signals. THE key parameter.")
+min_strength = input.float(0.3, "Min Divergence Strength", minval=0.0, maxval=1.0, step=0.05, group="Strength Filter", tooltip="Lowered from 0.6 to 0.3 — sweep quality filters now handle signal filtering")
 strength_period = input.int(100, "Strength Lookback Period", minval=10, maxval=500, group="Strength Filter")
 
 // ========== SIGNAL CONTROL ==========
@@ -79,8 +75,7 @@ bear_color = input.color(color.red, "Bearish Signal", group="Visual")
 level_line_color = input.color(color.new(#3179f5, 50), "Swept Level Line Color", group="Visual")
 
 // ========== CVD CALCULATION ==========
-// Raw CVD (no smoothing — sensitivity analysis confirmed smoothing hurts)
-// Anchored to 1D (anchor period had zero impact on results)
+// Raw CVD (no smoothing), anchored to 1D
 upAndDownVolume() =>
     posVol = 0.0
     negVol = 0.0
@@ -130,8 +125,15 @@ cvd_range = math.max(cvd_highest - cvd_lowest, 1.0)
 // ========== ATR FOR RISK MANAGEMENT ==========
 atr_val = ta.atr(sl_atr_period)
 
-// ========== SWEEP THRESHOLD ==========
+// ========== SWEEP THRESHOLDS ==========
 sweep_threshold = sweep_ticks * syminfo.mintick
+max_sweep_threshold = max_sweep_ticks * syminfo.mintick
+
+// ========== APPROACH MOMENTUM (pre-compute) ==========
+// Bearish setup (sweep of highs): price should have been moving UP into the level
+bear_approach_ok = use_approach ? (high - close[approach_bars] >= approach_min_atr * atr_val) : true
+// Bullish setup (sweep of lows): price should have been moving DOWN into the level
+bull_approach_ok = use_approach ? (close[approach_bars] - low >= approach_min_atr * atr_val) : true
 
 // ========== SWING LEVEL TRACKING ==========
 price_pivot_high = ta.pivothigh(high, pivot_left, pivot_right)
@@ -216,7 +218,11 @@ if array.size(swing_hi_price) > 0
         if high > sh_price + sweep_threshold
             array.push(consumed, i)
 
-            if cvd < sh_cvd
+            // Max sweep distance: reject if price blew too far past (breakout, not sweep)
+            sweep_dist = high - sh_price
+            sweep_ok = sweep_dist <= max_sweep_threshold
+
+            if cvd < sh_cvd and sweep_ok
                 div_magnitude = math.abs(cvd - sh_cvd)
                 this_strength = math.min(div_magnitude / cvd_range, 1.0)
 
@@ -234,7 +240,10 @@ if array.size(swing_hi_price) > 0
             array.remove(swing_hi_cvd, idx)
             array.remove(swing_hi_bar, idx)
 
-    if found and best_strength >= min_strength and (bar_index - last_bear_bar) >= signal_cooldown
+    // Rejection filter: sweep bar must close BELOW the swept level (wick above, close below = rejection)
+    rejection_ok = use_rejection ? (close < f_swept_price) : true
+
+    if found and best_strength >= min_strength and rejection_ok and bear_approach_ok and (bar_index - last_bear_bar) >= signal_cooldown
         bearish_divergence := true
         bear_strength_out := best_strength
         bear_dbg_price := high
@@ -260,7 +269,11 @@ if array.size(swing_lo_price) > 0
         if low < sl_price - sweep_threshold
             array.push(consumed, i)
 
-            if cvd > sl_cvd
+            // Max sweep distance: reject if price blew too far past (breakout, not sweep)
+            sweep_dist = sl_price - low
+            sweep_ok = sweep_dist <= max_sweep_threshold
+
+            if cvd > sl_cvd and sweep_ok
                 div_magnitude = math.abs(cvd - sl_cvd)
                 this_strength = math.min(div_magnitude / cvd_range, 1.0)
 
@@ -278,7 +291,10 @@ if array.size(swing_lo_price) > 0
             array.remove(swing_lo_cvd, idx)
             array.remove(swing_lo_bar, idx)
 
-    if found and best_strength >= min_strength and (bar_index - last_bull_bar) >= signal_cooldown
+    // Rejection filter: sweep bar must close ABOVE the swept level (wick below, close above = rejection)
+    rejection_ok = use_rejection ? (close > f_swept_price) : true
+
+    if found and best_strength >= min_strength and rejection_ok and bull_approach_ok and (bar_index - last_bull_bar) >= signal_cooldown
         bullish_divergence := true
         bull_strength_out := best_strength
         bull_dbg_price := low
@@ -353,11 +369,11 @@ if show_swept_lines and bearish_divergence and not na(bear_swept_origin_bar)
 if show_swept_lines and bullish_divergence and not na(bull_swept_origin_bar)
     line.new(bull_swept_origin_bar, bull_dbg_swept_price, bar_index + line_extend_bars, bull_dbg_swept_price, color=level_line_color, width=2, style=line.style_solid)
 
-// Debug labels
+// Debug labels (updated to show filter info)
 if show_debug and bearish_divergence
-    label.new(bar_index, bear_dbg_swept_price, "Sweep: " + str.tostring(bear_dbg_price, "#.##") + "\nLevel: " + str.tostring(bear_dbg_swept_price, "#.##") + "\nCVD: " + str.tostring(bear_dbg_cvd, "#") + "\nStr: " + str.tostring(bear_strength_out, "#.##"), color=bear_color, textcolor=color.white, size=size.small, style=label.style_label_down)
+    label.new(bar_index, bear_dbg_swept_price, "Sweep: " + str.tostring(bear_dbg_price, "#.##") + "\nLevel: " + str.tostring(bear_dbg_swept_price, "#.##") + "\nCVD: " + str.tostring(bear_dbg_cvd, "#") + "\nStr: " + str.tostring(bear_strength_out, "#.##") + "\nRej: " + str.tostring(close < bear_dbg_swept_price) + "\nAppr: " + str.tostring(bear_approach_ok), color=bear_color, textcolor=color.white, size=size.small, style=label.style_label_down)
 if show_debug and bullish_divergence
-    label.new(bar_index, bull_dbg_swept_price, "Sweep: " + str.tostring(bull_dbg_price, "#.##") + "\nLevel: " + str.tostring(bull_dbg_swept_price, "#.##") + "\nCVD: " + str.tostring(bull_dbg_cvd, "#") + "\nStr: " + str.tostring(bull_strength_out, "#.##"), color=bull_color, textcolor=color.white, size=size.small, style=label.style_label_up)
+    label.new(bar_index, bull_dbg_swept_price, "Sweep: " + str.tostring(bull_dbg_price, "#.##") + "\nLevel: " + str.tostring(bull_dbg_swept_price, "#.##") + "\nCVD: " + str.tostring(bull_dbg_cvd, "#") + "\nStr: " + str.tostring(bull_strength_out, "#.##") + "\nRej: " + str.tostring(close > bull_dbg_swept_price) + "\nAppr: " + str.tostring(bull_approach_ok), color=bull_color, textcolor=color.white, size=size.small, style=label.style_label_up)
 
 // Background
 bear_bg_alpha = bearish_divergence ? math.round(90 - bear_strength_out * 30) : 100
@@ -366,10 +382,10 @@ bgcolor(bearish_divergence ? color.new(bear_color, bear_bg_alpha) : na)
 bgcolor(bullish_divergence ? color.new(bull_color, bull_bg_alpha) : na)
 
 // ========== STRATEGY INFO TABLE ==========
-var table info_table = table.new(position.top_right, 2, 8, bgcolor=color.new(color.black, 80), border_width=1)
+var table info_table = table.new(position.top_right, 2, 10, bgcolor=color.new(color.black, 80), border_width=1)
 if barstate.islast
-    table.cell(info_table, 0, 0, "PHANTOM v2.0", text_color=color.white, text_size=size.small)
-    table.cell(info_table, 1, 0, "Optimized", text_color=color.gray, text_size=size.small)
+    table.cell(info_table, 0, 0, "PHANTOM v2.1", text_color=color.white, text_size=size.small)
+    table.cell(info_table, 1, 0, "Quality Filters", text_color=color.gray, text_size=size.small)
     table.cell(info_table, 0, 1, "Net P&L", text_color=color.gray, text_size=size.tiny)
     table.cell(info_table, 1, 1, str.tostring(strategy.netprofit, "#.##"), text_color=strategy.netprofit >= 0 ? color.green : color.red, text_size=size.tiny)
     table.cell(info_table, 0, 2, "Win Rate", text_color=color.gray, text_size=size.tiny)
@@ -383,8 +399,12 @@ if barstate.islast
     table.cell(info_table, 1, 5, str.tostring(strategy.max_drawdown, "#.##"), text_color=color.red, text_size=size.tiny)
     table.cell(info_table, 0, 6, "Strength", text_color=color.gray, text_size=size.tiny)
     table.cell(info_table, 1, 6, str.tostring(min_strength, "#.##"), text_color=color.white, text_size=size.tiny)
-    table.cell(info_table, 0, 7, "Direction", text_color=color.gray, text_size=size.tiny)
-    table.cell(info_table, 1, 7, trade_direction, text_color=color.white, text_size=size.tiny)
+    table.cell(info_table, 0, 7, "Rejection", text_color=color.gray, text_size=size.tiny)
+    table.cell(info_table, 1, 7, use_rejection ? "ON" : "OFF", text_color=use_rejection ? color.green : color.gray, text_size=size.tiny)
+    table.cell(info_table, 0, 8, "Max Sweep", text_color=color.gray, text_size=size.tiny)
+    table.cell(info_table, 1, 8, str.tostring(max_sweep_ticks) + " ticks", text_color=color.white, text_size=size.tiny)
+    table.cell(info_table, 0, 9, "Direction", text_color=color.gray, text_size=size.tiny)
+    table.cell(info_table, 1, 9, trade_direction, text_color=color.white, text_size=size.tiny)
 
 // ========== ALERTS ==========
 alertcondition(bearish_divergence, "Bearish Signal", "PHANTOM: Short entry signal!")
