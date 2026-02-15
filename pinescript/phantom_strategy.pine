@@ -7,18 +7,19 @@ strategy("PHANTOM STRATEGY", overlay=true, max_bars_back=5000, max_lines_count=1
      currency=currency.USD)
 
 // ========================================
-// PHANTOM CVD Divergence Strategy v2.1
-// Sweep Quality Filters Edition
+// PHANTOM CVD Divergence Strategy v2.2
+// Multi-Source Divergence Edition
 //
-// v2.1 adds three sweep quality filters that let us lower min_strength
-// from 0.6 to 0.3, capturing more good signals while filtering bad ones:
+// v2.2 adds support for external divergence sources (BATD.NY, BATD.DJ, etc.)
+// so the same sweep + divergence detection logic can be tested across
+// different markets and data feeds.
 //
-//   1. Sweep Rejection — bar must close back past the level (wick, not breakout)
-//   2. Max Sweep Distance — rejects sweeps that penetrate too far (breakouts)
-//   3. Approach Momentum — requires directional move into the level before sweep
+// Divergence source options:
+//   - Estimated CVD (default — works on any symbol)
+//   - External Symbol (BATD.NY, BATD.DJ, or any TradingView symbol)
 //
-// These filters target the structural quality of the sweep itself,
-// rather than relying solely on CVD divergence magnitude.
+// The sweep detection, quality filters, and risk management are
+// completely agnostic to the divergence data source.
 // ========================================
 
 // ========== STRATEGY DIRECTION ==========
@@ -44,6 +45,13 @@ use_session_filter = input.bool(true, "Enable Session Filter", group="Session Fi
 session_start = input.session("0930-1600", "Trading Session", group="Session Filter", tooltip="Only trade during this session (exchange timezone)")
 close_at_session_end = input.bool(true, "Close Positions at Session End", group="Session Filter")
 
+// ========== DIVERGENCE SOURCE ==========
+div_source = input.string("Estimated CVD", "Divergence Source", options=["Estimated CVD", "External Symbol"], group="Divergence Source", tooltip="Choose the data used for divergence detection. Estimated CVD works on any symbol. External Symbol lets you use BATD.NY, BATD.DJ, or any TradingView symbol.")
+ext_symbol = input.symbol("BATD.NY", "External Symbol", group="Divergence Source", tooltip="TradingView symbol to use for divergence data (e.g. BATD.NY, BATD.DJ, USI:VOLD.NY)")
+ext_field = input.string("Close", "External Field", options=["Close", "Open", "High", "Low", "HL2", "HLC3"], group="Divergence Source", tooltip="Which price field of the external symbol to use")
+ext_cumulate = input.bool(false, "Cumulate External Data", group="Divergence Source", tooltip="ON: accumulate the external data intraday (like CVD from per-bar deltas). OFF: use the raw value as-is (for symbols that are already cumulative like BATD).")
+ext_timeframe = input.timeframe("", "External Timeframe", group="Divergence Source", tooltip="Timeframe for the external symbol. Leave blank to use chart timeframe.")
+
 // ========== SWING DETECTION ==========
 pivot_left = input.int(10, "Pivot Left Bars", minval=2, maxval=50, group="Swing Detection")
 pivot_right = input.int(1, "Pivot Right Bars", minval=1, maxval=10, group="Swing Detection")
@@ -53,9 +61,9 @@ max_level_age = input.int(100, "Max Swing Level Age (bars)", minval=20, maxval=1
 sweep_ticks = input.int(2, "Min Sweep (ticks past level)", minval=1, maxval=10, group="Sweep Detection", tooltip="Minimum penetration to count as a sweep")
 
 // ========== SWEEP QUALITY FILTERS ==========
-use_rejection = input.bool(true, "Require Sweep Rejection", group="Sweep Quality", tooltip="Sweep bar must close back past the level — wick through, not breakout. This is the key filter for clean liquidity grabs.")
-max_sweep_ticks = input.int(8, "Max Sweep Distance (ticks)", minval=2, maxval=50, group="Sweep Quality", tooltip="Reject sweeps that penetrate too far past the level (likely genuine breakouts, not liquidity grabs)")
-use_approach = input.bool(true, "Require Approach Momentum", group="Sweep Quality", tooltip="Price must have made a directional move toward the level before the sweep, filtering out choppy sideways grinds into levels")
+use_rejection = input.bool(true, "Require Sweep Rejection", group="Sweep Quality", tooltip="Sweep bar must close back past the level — wick through, not breakout.")
+max_sweep_ticks = input.int(8, "Max Sweep Distance (ticks)", minval=2, maxval=50, group="Sweep Quality", tooltip="Reject sweeps that penetrate too far past the level (likely breakouts)")
+use_approach = input.bool(true, "Require Approach Momentum", group="Sweep Quality", tooltip="Price must have made a directional move toward the level before the sweep")
 approach_bars = input.int(5, "Approach Lookback (bars)", minval=2, maxval=20, group="Sweep Quality")
 approach_min_atr = input.float(0.5, "Min Approach Move (ATR mult)", minval=0.1, maxval=3.0, step=0.1, group="Sweep Quality", tooltip="Minimum directional move into the level, measured in ATR multiples")
 
@@ -74,8 +82,9 @@ bull_color = input.color(color.green, "Bullish Signal", group="Visual")
 bear_color = input.color(color.red, "Bearish Signal", group="Visual")
 level_line_color = input.color(color.new(#3179f5, 50), "Swept Level Line Color", group="Visual")
 
-// ========== CVD CALCULATION ==========
-// Raw CVD (no smoothing), anchored to 1D
+// ========== DIVERGENCE DATA CALCULATION ==========
+
+// --- Option 1: Estimated CVD (from bar direction) ---
 upAndDownVolume() =>
     posVol = 0.0
     negVol = 0.0
@@ -115,12 +124,43 @@ var cumulLastVolume = 0.0
 anchorChange = timeframe.change("1D") or (not na(lastVolume) and na(lastVolume[1]))
 cumulOpenVolume = anchorChange ? 0.0 : cumulLastVolume[1]
 cumulLastVolume := cumulOpenVolume + lastVolume
-cvd = cumulLastVolume
+estimated_cvd = cumulLastVolume
+
+// --- Option 2: External Symbol ---
+ext_tf = ext_timeframe == "" ? timeframe.period : ext_timeframe
+
+// Fetch the selected field from the external symbol
+ext_close = request.security(ext_symbol, ext_tf, close)
+ext_open = request.security(ext_symbol, ext_tf, open)
+ext_high = request.security(ext_symbol, ext_tf, high)
+ext_low = request.security(ext_symbol, ext_tf, low)
+ext_hl2_val = request.security(ext_symbol, ext_tf, hl2)
+ext_hlc3_val = request.security(ext_symbol, ext_tf, hlc3)
+
+ext_raw = switch ext_field
+    "Close" => ext_close
+    "Open"  => ext_open
+    "High"  => ext_high
+    "Low"   => ext_low
+    "HL2"   => ext_hl2_val
+    "HLC3"  => ext_hlc3_val
+    => ext_close
+
+// Optionally cumulate the external data intraday
+var ext_cumul = 0.0
+ext_anchor = timeframe.change("1D")
+if ext_cumulate
+    ext_cumul := ext_anchor ? ext_raw : ext_cumul[1] + ext_raw
+else
+    ext_cumul := ext_raw
+
+// --- Select active divergence source ---
+delta = div_source == "Estimated CVD" ? estimated_cvd : ext_cumul
 
 // ========== STRENGTH CALCULATION ==========
-cvd_highest = ta.highest(cvd, strength_period)
-cvd_lowest = ta.lowest(cvd, strength_period)
-cvd_range = math.max(cvd_highest - cvd_lowest, 1.0)
+delta_highest = ta.highest(delta, strength_period)
+delta_lowest = ta.lowest(delta, strength_period)
+delta_range = math.max(delta_highest - delta_lowest, 1.0)
 
 // ========== ATR FOR RISK MANAGEMENT ==========
 atr_val = ta.atr(sl_atr_period)
@@ -130,9 +170,7 @@ sweep_threshold = sweep_ticks * syminfo.mintick
 max_sweep_threshold = max_sweep_ticks * syminfo.mintick
 
 // ========== APPROACH MOMENTUM (pre-compute) ==========
-// Bearish setup (sweep of highs): price should have been moving UP into the level
 bear_approach_ok = use_approach ? (high - close[approach_bars] >= approach_min_atr * atr_val) : true
-// Bullish setup (sweep of lows): price should have been moving DOWN into the level
 bull_approach_ok = use_approach ? (close[approach_bars] - low >= approach_min_atr * atr_val) : true
 
 // ========== SWING LEVEL TRACKING ==========
@@ -140,21 +178,21 @@ price_pivot_high = ta.pivothigh(high, pivot_left, pivot_right)
 price_pivot_low = ta.pivotlow(low, pivot_left, pivot_right)
 
 var array<float> swing_hi_price = array.new<float>(0)
-var array<float> swing_hi_cvd = array.new<float>(0)
+var array<float> swing_hi_delta = array.new<float>(0)
 var array<int> swing_hi_bar = array.new<int>(0)
 
 var array<float> swing_lo_price = array.new<float>(0)
-var array<float> swing_lo_cvd = array.new<float>(0)
+var array<float> swing_lo_delta = array.new<float>(0)
 var array<int> swing_lo_bar = array.new<int>(0)
 
 if not na(price_pivot_high)
     array.push(swing_hi_price, price_pivot_high)
-    array.push(swing_hi_cvd, cvd[pivot_right])
+    array.push(swing_hi_delta, delta[pivot_right])
     array.push(swing_hi_bar, bar_index - pivot_right)
 
 if not na(price_pivot_low)
     array.push(swing_lo_price, price_pivot_low)
-    array.push(swing_lo_cvd, cvd[pivot_right])
+    array.push(swing_lo_delta, delta[pivot_right])
     array.push(swing_lo_bar, bar_index - pivot_right)
 
 // ========== PRUNE OLD LEVELS ==========
@@ -162,24 +200,24 @@ if array.size(swing_hi_price) > 0
     for i = array.size(swing_hi_price) - 1 to 0
         if (bar_index - array.get(swing_hi_bar, i)) > max_level_age
             array.remove(swing_hi_price, i)
-            array.remove(swing_hi_cvd, i)
+            array.remove(swing_hi_delta, i)
             array.remove(swing_hi_bar, i)
 
 if array.size(swing_lo_price) > 0
     for i = array.size(swing_lo_price) - 1 to 0
         if (bar_index - array.get(swing_lo_bar, i)) > max_level_age
             array.remove(swing_lo_price, i)
-            array.remove(swing_lo_cvd, i)
+            array.remove(swing_lo_delta, i)
             array.remove(swing_lo_bar, i)
 
 while array.size(swing_hi_price) > 30
     array.shift(swing_hi_price)
-    array.shift(swing_hi_cvd)
+    array.shift(swing_hi_delta)
     array.shift(swing_hi_bar)
 
 while array.size(swing_lo_price) > 30
     array.shift(swing_lo_price)
-    array.shift(swing_lo_cvd)
+    array.shift(swing_lo_delta)
     array.shift(swing_lo_bar)
 
 // ========== LIQUIDITY SWEEP + DIVERGENCE DETECTION ==========
@@ -192,113 +230,109 @@ bullish_divergence = false
 var float bear_strength_out = 0.0
 var float bull_strength_out = 0.0
 var float bear_dbg_price = na
-var float bear_dbg_cvd = na
+var float bear_dbg_delta = na
 var float bear_dbg_swept_price = na
 var int bear_swept_origin_bar = na
 
 var float bull_dbg_price = na
-var float bull_dbg_cvd = na
+var float bull_dbg_delta = na
 var float bull_dbg_swept_price = na
 var int bull_swept_origin_bar = na
 
-// --- BEARISH: Price sweeps above a prior swing high, CVD lower ---
+// --- BEARISH: Price sweeps above a prior swing high, delta lower ---
 if array.size(swing_hi_price) > 0
     array<int> consumed = array.new<int>(0)
     float best_strength = 0.0
     bool found = false
     float f_swept_price = na
-    float f_swept_cvd = na
+    float f_swept_delta = na
     int f_swept_bar = na
 
     for i = 0 to array.size(swing_hi_price) - 1
         sh_price = array.get(swing_hi_price, i)
-        sh_cvd = array.get(swing_hi_cvd, i)
+        sh_delta = array.get(swing_hi_delta, i)
         sh_bar = array.get(swing_hi_bar, i)
 
         if high > sh_price + sweep_threshold
             array.push(consumed, i)
 
-            // Max sweep distance: reject if price blew too far past (breakout, not sweep)
             sweep_dist = high - sh_price
             sweep_ok = sweep_dist <= max_sweep_threshold
 
-            if cvd < sh_cvd and sweep_ok
-                div_magnitude = math.abs(cvd - sh_cvd)
-                this_strength = math.min(div_magnitude / cvd_range, 1.0)
+            if delta < sh_delta and sweep_ok
+                div_magnitude = math.abs(delta - sh_delta)
+                this_strength = math.min(div_magnitude / delta_range, 1.0)
 
                 if this_strength > best_strength
                     best_strength := this_strength
                     found := true
                     f_swept_price := sh_price
-                    f_swept_cvd := sh_cvd
+                    f_swept_delta := sh_delta
                     f_swept_bar := sh_bar
 
     if array.size(consumed) > 0
         for i = array.size(consumed) - 1 to 0
             idx = array.get(consumed, i)
             array.remove(swing_hi_price, idx)
-            array.remove(swing_hi_cvd, idx)
+            array.remove(swing_hi_delta, idx)
             array.remove(swing_hi_bar, idx)
 
-    // Rejection filter: sweep bar must close BELOW the swept level (wick above, close below = rejection)
     rejection_ok = use_rejection ? (close < f_swept_price) : true
 
     if found and best_strength >= min_strength and rejection_ok and bear_approach_ok and (bar_index - last_bear_bar) >= signal_cooldown
         bearish_divergence := true
         bear_strength_out := best_strength
         bear_dbg_price := high
-        bear_dbg_cvd := cvd
+        bear_dbg_delta := delta
         bear_dbg_swept_price := f_swept_price
         bear_swept_origin_bar := f_swept_bar
         last_bear_bar := bar_index
 
-// --- BULLISH: Price sweeps below a prior swing low, CVD higher ---
+// --- BULLISH: Price sweeps below a prior swing low, delta higher ---
 if array.size(swing_lo_price) > 0
     array<int> consumed = array.new<int>(0)
     float best_strength = 0.0
     bool found = false
     float f_swept_price = na
-    float f_swept_cvd = na
+    float f_swept_delta = na
     int f_swept_bar = na
 
     for i = 0 to array.size(swing_lo_price) - 1
         sl_price = array.get(swing_lo_price, i)
-        sl_cvd = array.get(swing_lo_cvd, i)
+        sl_delta = array.get(swing_lo_delta, i)
         sl_bar = array.get(swing_lo_bar, i)
 
         if low < sl_price - sweep_threshold
             array.push(consumed, i)
 
-            // Max sweep distance: reject if price blew too far past (breakout, not sweep)
             sweep_dist = sl_price - low
             sweep_ok = sweep_dist <= max_sweep_threshold
 
-            if cvd > sl_cvd and sweep_ok
-                div_magnitude = math.abs(cvd - sl_cvd)
-                this_strength = math.min(div_magnitude / cvd_range, 1.0)
+            if delta > sl_delta and sweep_ok
+                div_magnitude = math.abs(delta - sl_delta)
+                this_strength = math.min(div_magnitude / delta_range, 1.0)
 
                 if this_strength > best_strength
                     best_strength := this_strength
                     found := true
                     f_swept_price := sl_price
-                    f_swept_cvd := sl_cvd
+                    f_swept_delta := sl_delta
                     f_swept_bar := sl_bar
 
     if array.size(consumed) > 0
         for i = array.size(consumed) - 1 to 0
             idx = array.get(consumed, i)
             array.remove(swing_lo_price, idx)
-            array.remove(swing_lo_cvd, idx)
+            array.remove(swing_lo_delta, idx)
             array.remove(swing_lo_bar, idx)
 
-    // Rejection filter: sweep bar must close ABOVE the swept level (wick below, close above = rejection)
     rejection_ok = use_rejection ? (close > f_swept_price) : true
 
     if found and best_strength >= min_strength and rejection_ok and bull_approach_ok and (bar_index - last_bull_bar) >= signal_cooldown
         bullish_divergence := true
         bull_strength_out := best_strength
         bull_dbg_price := low
-        bull_dbg_cvd := cvd
+        bull_dbg_delta := delta
         bull_dbg_swept_price := f_swept_price
         bull_swept_origin_bar := f_swept_bar
         last_bull_bar := bar_index
@@ -369,11 +403,12 @@ if show_swept_lines and bearish_divergence and not na(bear_swept_origin_bar)
 if show_swept_lines and bullish_divergence and not na(bull_swept_origin_bar)
     line.new(bull_swept_origin_bar, bull_dbg_swept_price, bar_index + line_extend_bars, bull_dbg_swept_price, color=level_line_color, width=2, style=line.style_solid)
 
-// Debug labels (updated to show filter info)
+// Debug labels
+src_label = div_source == "Estimated CVD" ? "CVD" : str.replace_all(ext_symbol, ":", ".")
 if show_debug and bearish_divergence
-    label.new(bar_index, bear_dbg_swept_price, "Sweep: " + str.tostring(bear_dbg_price, "#.##") + "\nLevel: " + str.tostring(bear_dbg_swept_price, "#.##") + "\nCVD: " + str.tostring(bear_dbg_cvd, "#") + "\nStr: " + str.tostring(bear_strength_out, "#.##") + "\nRej: " + str.tostring(close < bear_dbg_swept_price) + "\nAppr: " + str.tostring(bear_approach_ok), color=bear_color, textcolor=color.white, size=size.small, style=label.style_label_down)
+    label.new(bar_index, bear_dbg_swept_price, "Sweep: " + str.tostring(bear_dbg_price, "#.##") + "\nLevel: " + str.tostring(bear_dbg_swept_price, "#.##") + "\n" + src_label + ": " + str.tostring(bear_dbg_delta, "#") + "\nStr: " + str.tostring(bear_strength_out, "#.##") + "\nRej: " + str.tostring(close < bear_dbg_swept_price) + "\nAppr: " + str.tostring(bear_approach_ok), color=bear_color, textcolor=color.white, size=size.small, style=label.style_label_down)
 if show_debug and bullish_divergence
-    label.new(bar_index, bull_dbg_swept_price, "Sweep: " + str.tostring(bull_dbg_price, "#.##") + "\nLevel: " + str.tostring(bull_dbg_swept_price, "#.##") + "\nCVD: " + str.tostring(bull_dbg_cvd, "#") + "\nStr: " + str.tostring(bull_strength_out, "#.##") + "\nRej: " + str.tostring(close > bull_dbg_swept_price) + "\nAppr: " + str.tostring(bull_approach_ok), color=bull_color, textcolor=color.white, size=size.small, style=label.style_label_up)
+    label.new(bar_index, bull_dbg_swept_price, "Sweep: " + str.tostring(bull_dbg_price, "#.##") + "\nLevel: " + str.tostring(bull_dbg_swept_price, "#.##") + "\n" + src_label + ": " + str.tostring(bull_dbg_delta, "#") + "\nStr: " + str.tostring(bull_strength_out, "#.##") + "\nRej: " + str.tostring(close > bull_dbg_swept_price) + "\nAppr: " + str.tostring(bull_approach_ok), color=bull_color, textcolor=color.white, size=size.small, style=label.style_label_up)
 
 // Background
 bear_bg_alpha = bearish_divergence ? math.round(90 - bear_strength_out * 30) : 100
@@ -384,8 +419,8 @@ bgcolor(bullish_divergence ? color.new(bull_color, bull_bg_alpha) : na)
 // ========== STRATEGY INFO TABLE ==========
 var table info_table = table.new(position.top_right, 2, 10, bgcolor=color.new(color.black, 80), border_width=1)
 if barstate.islast
-    table.cell(info_table, 0, 0, "PHANTOM v2.1", text_color=color.white, text_size=size.small)
-    table.cell(info_table, 1, 0, "Quality Filters", text_color=color.gray, text_size=size.small)
+    table.cell(info_table, 0, 0, "PHANTOM v2.2", text_color=color.white, text_size=size.small)
+    table.cell(info_table, 1, 0, div_source == "Estimated CVD" ? "Est. CVD" : ext_symbol, text_color=color.gray, text_size=size.small)
     table.cell(info_table, 0, 1, "Net P&L", text_color=color.gray, text_size=size.tiny)
     table.cell(info_table, 1, 1, str.tostring(strategy.netprofit, "#.##"), text_color=strategy.netprofit >= 0 ? color.green : color.red, text_size=size.tiny)
     table.cell(info_table, 0, 2, "Win Rate", text_color=color.gray, text_size=size.tiny)
