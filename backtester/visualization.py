@@ -31,7 +31,7 @@ class BacktestChart:
     """
 
     TV_DARK_BG = "#121825"
-    TV_GRID = "#f0f3fa00"  # transparent grid
+    TV_GRID = "rgba(240,243,250,0)"  # transparent grid
     TV_TEXT = "#b2b5be"
     TV_CANDLE = "rgba(255, 235, 59, 0.75)"  # yellow candles
     TV_GREEN = "#26a69a"
