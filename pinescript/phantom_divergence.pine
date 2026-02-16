@@ -1,0 +1,380 @@
+//@version=5
+indicator("PHANTOM DIVERGENCE", overlay=true, max_bars_back=5000, max_lines_count=200, max_labels_count=100)
+
+// ========================================
+// PHANTOM DIVERGENCE v3.0
+// Clean structural divergence indicator — built from scratch
+//
+// Fixes from v2.x testing:
+//   1. Daily reset — all levels cleared at session start (no prior-day pollution)
+//   2. Session open buffer — skip first N minutes (opening volatility is noise)
+//   3. Bar quality filter — reject signals on oversized bars (> N x ATR)
+//   4. Min level age — ensures a real pullback structure between pivot and sweep
+//   5. External delta source (BATD.NY, BATD.DJ) or Estimated CVD
+//   6. Cooldowns reset at session start
+//   7. Pure indicator (not strategy) — just signals + alerts
+//
+// Core logic:
+//   BEARISH: ES sweeps above a prior swing high → delta is LOWER than at that high
+//   BULLISH: ES sweeps below a prior swing low  → delta is HIGHER than at that low
+//   + Rejection (wick, not breakout) + quality checks
+// ========================================
+
+// ========== DELTA SOURCE ==========
+delta_mode = input.string("External Symbol", "Delta Source", options=["External Symbol", "Estimated CVD"], group="Delta Source", tooltip="External Symbol: use BATD.NY, BATD.DJ, or any TV symbol. Estimated CVD: approximated from bar direction (works on any symbol).")
+delta_symbol = input.symbol("BATD.NY", "External Symbol", group="Delta Source", tooltip="e.g. BATD.NY, BATD.DJ, USI:VOLD.NY")
+delta_field = input.string("Close", "External Field", options=["Close", "Open", "High", "Low", "HL2", "HLC3"], group="Delta Source")
+delta_tf = input.timeframe("", "External Timeframe", group="Delta Source", tooltip="Blank = chart timeframe")
+
+// ========== SESSION ==========
+session_time = input.session("0930-1600", "Trading Session", group="Session", tooltip="Levels reset at session start. Signals only fire within session.")
+open_buffer_mins = input.int(5, "Session Open Buffer (minutes)", minval=0, maxval=30, group="Session", tooltip="Skip signals during the first N minutes of the session — opening volatility produces low-quality signals")
+
+// ========== SWING DETECTION ==========
+pivot_left = input.int(10, "Pivot Left Bars", minval=2, maxval=50, group="Swing Detection")
+pivot_right = input.int(1, "Pivot Right Bars", minval=1, maxval=10, group="Swing Detection")
+
+// ========== SWEEP DETECTION ==========
+sweep_ticks = input.int(2, "Min Sweep (ticks past level)", minval=1, maxval=10, group="Sweep Detection", tooltip="Minimum penetration to count as a sweep")
+max_sweep_ticks = input.int(8, "Max Sweep (ticks past level)", minval=2, maxval=50, group="Sweep Detection", tooltip="Cap: beyond this it's a breakout, not a sweep")
+
+// ========== QUALITY FILTERS ==========
+use_rejection = input.bool(true, "Require Sweep Rejection", group="Quality Filters", tooltip="Bar must close back past the level (wick through, not breakout)")
+use_bar_filter = input.bool(true, "Reject Oversized Bars", group="Quality Filters", tooltip="Filter out signals on abnormally large bars (session opens, news spikes)")
+max_bar_atr = input.float(2.0, "Max Bar Size (ATR mult)", minval=1.0, maxval=5.0, step=0.25, group="Quality Filters", tooltip="Bars larger than this many ATRs are rejected")
+atr_period = input.int(14, "ATR Period", minval=5, maxval=50, group="Quality Filters")
+min_level_age = input.int(10, "Min Level Age (bars)", minval=1, maxval=100, group="Quality Filters", tooltip="Pivot must be at least this many bars old before it can be swept. Ensures a real pullback between the pivot high/low and the sweep — filters out choppy grinds.")
+
+// ========== SIGNAL CONTROL ==========
+signal_cooldown = input.int(5, "Signal Cooldown (bars)", minval=0, maxval=50, group="Signal Control")
+
+// ========== VISUAL ==========
+show_swept_lines = input.bool(true, "Show Swept Level Lines", group="Visual")
+line_extend_bars = input.int(8, "Line Extension", minval=2, maxval=30, group="Visual")
+show_active_levels = input.bool(false, "Show Active Swing Levels", group="Visual", tooltip="Draw horizontal lines for all tracked swing levels (can be noisy)")
+show_debug = input.bool(false, "Show Debug Labels", group="Visual")
+bull_color = input.color(color.green, "Bullish Signal", group="Visual")
+bear_color = input.color(color.red, "Bearish Signal", group="Visual")
+level_color = input.color(color.new(#3179f5, 50), "Level Line Color", group="Visual")
+
+// ========== DELTA SOURCE CALCULATION ==========
+
+// --- Estimated CVD (fallback — works on any symbol) ---
+upAndDownVolume() =>
+    posVol = 0.0
+    negVol = 0.0
+    var isBuyVolume = true
+    switch
+        close > open     => isBuyVolume := true
+        close < open     => isBuyVolume := false
+        close > close[1] => isBuyVolume := true
+        close < close[1] => isBuyVolume := false
+    if isBuyVolume
+        posVol += volume
+    else
+        negVol -= volume
+    posVol + negVol
+
+var lowerTimeframe = switch
+    timeframe.isseconds => "1S"
+    timeframe.isintraday => "1"
+    timeframe.isdaily   => "5"
+    => "60"
+
+diffVolArray = request.security_lower_tf(syminfo.tickerid, lowerTimeframe, upAndDownVolume())
+
+getHighLow(arr) =>
+    float cumVolume = na
+    float maxVolume = na
+    float minVolume = na
+    for item in arr
+        cumVolume := nz(cumVolume) + item
+        maxVolume := math.max(nz(maxVolume), cumVolume)
+        minVolume := math.min(nz(minVolume), cumVolume)
+    [maxVolume, minVolume, cumVolume]
+
+[maxVolume, minVolume, lastVolume] = getHighLow(diffVolArray)
+
+var cumulLastVolume = 0.0
+cvd_anchor_change = timeframe.change("1D") or (not na(lastVolume) and na(lastVolume[1]))
+cvd_open_volume = cvd_anchor_change ? 0.0 : cumulLastVolume[1]
+cumulLastVolume := cvd_open_volume + lastVolume
+estimated_cvd = cumulLastVolume
+
+// --- External Symbol ---
+ext_tf = delta_tf == "" ? timeframe.period : delta_tf
+ext_close = request.security(delta_symbol, ext_tf, close)
+ext_open  = request.security(delta_symbol, ext_tf, open)
+ext_high  = request.security(delta_symbol, ext_tf, high)
+ext_low   = request.security(delta_symbol, ext_tf, low)
+ext_hl2   = request.security(delta_symbol, ext_tf, hl2)
+ext_hlc3  = request.security(delta_symbol, ext_tf, hlc3)
+
+ext_val = switch delta_field
+    "Close" => ext_close
+    "Open"  => ext_open
+    "High"  => ext_high
+    "Low"   => ext_low
+    "HL2"   => ext_hl2
+    "HLC3"  => ext_hlc3
+    => ext_close
+
+// --- Select active delta ---
+delta = delta_mode == "Estimated CVD" ? estimated_cvd : ext_val
+
+// ========== SESSION DETECTION ==========
+in_session = not na(time(timeframe.period, session_time))
+new_session = in_session and not in_session[1]
+
+// Track session start bar for level filtering and open buffer
+var int session_start_bar = 0
+if new_session
+    session_start_bar := bar_index
+
+// Open buffer: skip first N minutes of session
+open_buffer_bars = math.round(open_buffer_mins / timeframe.in_seconds() * 60)
+past_open_buffer = (bar_index - session_start_bar) >= open_buffer_bars
+
+// ========== ATR ==========
+atr_val = ta.atr(atr_period)
+
+// ========== SWEEP THRESHOLDS ==========
+sweep_threshold = sweep_ticks * syminfo.mintick
+max_sweep_threshold = max_sweep_ticks * syminfo.mintick
+
+// ========== SWING LEVEL TRACKING ==========
+price_pivot_high = ta.pivothigh(high, pivot_left, pivot_right)
+price_pivot_low = ta.pivotlow(low, pivot_left, pivot_right)
+
+var array<float> swing_hi_price = array.new<float>(0)
+var array<float> swing_hi_delta = array.new<float>(0)
+var array<int> swing_hi_bar = array.new<int>(0)
+
+var array<float> swing_lo_price = array.new<float>(0)
+var array<float> swing_lo_delta = array.new<float>(0)
+var array<int> swing_lo_bar = array.new<int>(0)
+
+// --- DAILY RESET: clear everything at session start ---
+if new_session
+    array.clear(swing_hi_price)
+    array.clear(swing_hi_delta)
+    array.clear(swing_hi_bar)
+    array.clear(swing_lo_price)
+    array.clear(swing_lo_delta)
+    array.clear(swing_lo_bar)
+
+// --- Add new pivots (current session only) ---
+if not na(price_pivot_high) and in_session
+    pivot_bar = bar_index - pivot_right
+    if pivot_bar >= session_start_bar
+        array.push(swing_hi_price, price_pivot_high)
+        array.push(swing_hi_delta, delta[pivot_right])
+        array.push(swing_hi_bar, pivot_bar)
+
+if not na(price_pivot_low) and in_session
+    pivot_bar = bar_index - pivot_right
+    if pivot_bar >= session_start_bar
+        array.push(swing_lo_price, price_pivot_low)
+        array.push(swing_lo_delta, delta[pivot_right])
+        array.push(swing_lo_bar, pivot_bar)
+
+// --- Cap arrays ---
+while array.size(swing_hi_price) > 30
+    array.shift(swing_hi_price)
+    array.shift(swing_hi_delta)
+    array.shift(swing_hi_bar)
+
+while array.size(swing_lo_price) > 30
+    array.shift(swing_lo_price)
+    array.shift(swing_lo_delta)
+    array.shift(swing_lo_bar)
+
+// ========== SWEEP + DIVERGENCE DETECTION ==========
+var int last_bear_bar = -9999
+var int last_bull_bar = -9999
+
+// Reset cooldowns at session start
+if new_session
+    last_bear_bar := -9999
+    last_bull_bar := -9999
+
+bear_signal = false
+bull_signal = false
+
+var float bear_swept_price = na
+var int bear_swept_origin = na
+var float bear_dbg_delta = na
+var float bear_dbg_old_delta = na
+
+var float bull_swept_price = na
+var int bull_swept_origin = na
+var float bull_dbg_delta = na
+var float bull_dbg_old_delta = na
+
+// Bar quality: reject oversized bars
+bar_range = high - low
+bar_size_ok = use_bar_filter ? (bar_range <= max_bar_atr * atr_val) : true
+
+// Only detect within session, past open buffer, with OK bar size
+if in_session and past_open_buffer and bar_size_ok
+
+    // --- BEARISH: ES sweeps above a prior swing high, delta is lower ---
+    if array.size(swing_hi_price) > 0
+        array<int> consumed = array.new<int>(0)
+        bool found = false
+        float f_price = na
+        float f_delta = na
+        int f_bar = na
+
+        for i = 0 to array.size(swing_hi_price) - 1
+            sh_price = array.get(swing_hi_price, i)
+            sh_delta = array.get(swing_hi_delta, i)
+            sh_bar = array.get(swing_hi_bar, i)
+
+            // Check sweep: price exceeds level by at least min threshold
+            if high > sh_price + sweep_threshold
+                array.push(consumed, i)
+
+                // Quality checks:
+                sweep_dist = high - sh_price
+                level_age = bar_index - sh_bar
+                sweep_contained = sweep_dist <= max_sweep_threshold
+                age_ok = level_age >= min_level_age
+                has_divergence = delta < sh_delta
+
+                if sweep_contained and age_ok and has_divergence
+                    // Pick the level with the largest divergence (strongest signal)
+                    if not found or (sh_delta - delta) > (f_delta - delta)
+                        found := true
+                        f_price := sh_price
+                        f_delta := sh_delta
+                        f_bar := sh_bar
+
+        // Remove all consumed levels (swept = stops are taken, level is spent)
+        if array.size(consumed) > 0
+            for i = array.size(consumed) - 1 to 0
+                idx = array.get(consumed, i)
+                array.remove(swing_hi_price, idx)
+                array.remove(swing_hi_delta, idx)
+                array.remove(swing_hi_bar, idx)
+
+        // Rejection: close must be BELOW the swept level (wick above = rejection)
+        rejection_ok = use_rejection ? (not na(f_price) and close < f_price) : true
+
+        if found and rejection_ok and (bar_index - last_bear_bar) >= signal_cooldown
+            bear_signal := true
+            bear_swept_price := f_price
+            bear_swept_origin := f_bar
+            bear_dbg_delta := delta
+            bear_dbg_old_delta := f_delta
+            last_bear_bar := bar_index
+
+    // --- BULLISH: ES sweeps below a prior swing low, delta is higher ---
+    if array.size(swing_lo_price) > 0
+        array<int> consumed = array.new<int>(0)
+        bool found = false
+        float f_price = na
+        float f_delta = na
+        int f_bar = na
+
+        for i = 0 to array.size(swing_lo_price) - 1
+            sl_price = array.get(swing_lo_price, i)
+            sl_delta = array.get(swing_lo_delta, i)
+            sl_bar = array.get(swing_lo_bar, i)
+
+            if low < sl_price - sweep_threshold
+                array.push(consumed, i)
+
+                sweep_dist = sl_price - low
+                level_age = bar_index - sl_bar
+                sweep_contained = sweep_dist <= max_sweep_threshold
+                age_ok = level_age >= min_level_age
+                has_divergence = delta > sl_delta
+
+                if sweep_contained and age_ok and has_divergence
+                    if not found or (delta - sl_delta) > (delta - f_delta)
+                        found := true
+                        f_price := sl_price
+                        f_delta := sl_delta
+                        f_bar := sl_bar
+
+        if array.size(consumed) > 0
+            for i = array.size(consumed) - 1 to 0
+                idx = array.get(consumed, i)
+                array.remove(swing_lo_price, idx)
+                array.remove(swing_lo_delta, idx)
+                array.remove(swing_lo_bar, idx)
+
+        rejection_ok = use_rejection ? (not na(f_price) and close > f_price) : true
+
+        if found and rejection_ok and (bar_index - last_bull_bar) >= signal_cooldown
+            bull_signal := true
+            bull_swept_price := f_price
+            bull_swept_origin := f_bar
+            bull_dbg_delta := delta
+            bull_dbg_old_delta := f_delta
+            last_bull_bar := bar_index
+
+// ========== PLOTTING ==========
+
+// Signal arrows
+plotshape(bull_signal, "Bullish Signal", shape.triangleup, location.belowbar, bull_color, size=size.normal, text="LONG")
+plotshape(bear_signal, "Bearish Signal", shape.triangledown, location.abovebar, bear_color, size=size.normal, text="SHORT")
+
+// Swept level lines
+if show_swept_lines and bear_signal and not na(bear_swept_origin)
+    line.new(bear_swept_origin, bear_swept_price, bar_index + line_extend_bars, bear_swept_price, color=level_color, width=2, style=line.style_solid)
+if show_swept_lines and bull_signal and not na(bull_swept_origin)
+    line.new(bull_swept_origin, bull_swept_price, bar_index + line_extend_bars, bull_swept_price, color=level_color, width=2, style=line.style_solid)
+
+// Active level lines (optional — shows all tracked levels)
+// These are redrawn each bar so they extend to current bar
+if show_active_levels
+    if array.size(swing_hi_price) > 0
+        for i = 0 to array.size(swing_hi_price) - 1
+            l = line.new(array.get(swing_hi_bar, i), array.get(swing_hi_price, i), bar_index, array.get(swing_hi_price, i), color=color.new(bear_color, 70), width=1, style=line.style_dotted)
+            line.delete(l[1])
+    if array.size(swing_lo_price) > 0
+        for i = 0 to array.size(swing_lo_price) - 1
+            l = line.new(array.get(swing_lo_bar, i), array.get(swing_lo_price, i), bar_index, array.get(swing_lo_price, i), color=color.new(bull_color, 70), width=1, style=line.style_dotted)
+            line.delete(l[1])
+
+// Background tint on signals
+bgcolor(bear_signal ? color.new(bear_color, 90) : na)
+bgcolor(bull_signal ? color.new(bull_color, 90) : na)
+
+// Debug labels
+src_name = delta_mode == "Estimated CVD" ? "CVD" : delta_symbol
+if show_debug and bear_signal
+    label.new(bar_index, bear_swept_price, "SHORT\n" + src_name + " now: " + str.tostring(bear_dbg_delta, "#.#") + "\n" + src_name + " @lvl: " + str.tostring(bear_dbg_old_delta, "#.#") + "\nΔ: " + str.tostring(bear_dbg_delta - bear_dbg_old_delta, "#.#") + "\nBar/ATR: " + str.tostring(bar_range / atr_val, "#.#"), color=bear_color, textcolor=color.white, size=size.small, style=label.style_label_down)
+if show_debug and bull_signal
+    label.new(bar_index, bull_swept_price, "LONG\n" + src_name + " now: " + str.tostring(bull_dbg_delta, "#.#") + "\n" + src_name + " @lvl: " + str.tostring(bull_dbg_old_delta, "#.#") + "\nΔ: " + str.tostring(bull_dbg_delta - bull_dbg_old_delta, "#.#") + "\nBar/ATR: " + str.tostring(bar_range / atr_val, "#.#"), color=bull_color, textcolor=color.white, size=size.small, style=label.style_label_up)
+
+// Session separator
+if new_session
+    line.new(bar_index, high, bar_index, low, color=color.new(color.gray, 60), extend=extend.both, style=line.style_dotted, width=1)
+
+// ========== INFO TABLE ==========
+var table info_table = table.new(position.top_right, 2, 8, bgcolor=color.new(color.black, 80), border_width=1)
+if barstate.islast
+    table.cell(info_table, 0, 0, "PHANTOM DIV", text_color=color.white, text_size=size.small)
+    table.cell(info_table, 1, 0, "v3.0", text_color=color.gray, text_size=size.small)
+    table.cell(info_table, 0, 1, "Source", text_color=color.gray, text_size=size.tiny)
+    table.cell(info_table, 1, 1, delta_mode == "Estimated CVD" ? "Est. CVD" : delta_symbol, text_color=color.white, text_size=size.tiny)
+    table.cell(info_table, 0, 2, "Session", text_color=color.gray, text_size=size.tiny)
+    table.cell(info_table, 1, 2, in_session ? "ACTIVE" : "CLOSED", text_color=in_session ? color.green : color.red, text_size=size.tiny)
+    table.cell(info_table, 0, 3, "Levels ▲", text_color=color.gray, text_size=size.tiny)
+    table.cell(info_table, 1, 3, str.tostring(array.size(swing_hi_price)), text_color=color.white, text_size=size.tiny)
+    table.cell(info_table, 0, 4, "Levels ▼", text_color=color.gray, text_size=size.tiny)
+    table.cell(info_table, 1, 4, str.tostring(array.size(swing_lo_price)), text_color=color.white, text_size=size.tiny)
+    table.cell(info_table, 0, 5, "Rejection", text_color=color.gray, text_size=size.tiny)
+    table.cell(info_table, 1, 5, use_rejection ? "ON" : "OFF", text_color=use_rejection ? color.green : color.gray, text_size=size.tiny)
+    table.cell(info_table, 0, 6, "Bar Filter", text_color=color.gray, text_size=size.tiny)
+    table.cell(info_table, 1, 6, use_bar_filter ? str.tostring(max_bar_atr, "#.#") + "x ATR" : "OFF", text_color=use_bar_filter ? color.green : color.gray, text_size=size.tiny)
+    table.cell(info_table, 0, 7, "Open Buffer", text_color=color.gray, text_size=size.tiny)
+    table.cell(info_table, 1, 7, str.tostring(open_buffer_mins) + " min", text_color=color.white, text_size=size.tiny)
+
+// ========== ALERTS ==========
+alertcondition(bear_signal, "Bearish Signal", "PHANTOM DIV: Short signal — sweep of highs with delta divergence!")
+alertcondition(bull_signal, "Bullish Signal", "PHANTOM DIV: Long signal — sweep of lows with delta divergence!")
+alertcondition(bear_signal or bull_signal, "Any Signal", "PHANTOM DIV: Trade signal!")
