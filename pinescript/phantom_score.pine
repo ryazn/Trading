@@ -1,0 +1,440 @@
+//@version=5
+indicator("PHANTOM SCORE 7.0", overlay=true, max_bars_back=5000, max_lines_count=500, max_labels_count=500)
+
+// ================================================================
+// PHANTOM SCORE v7.0 — soft-scoring rewrite of PHANTOM DIVERGENCE
+// Theory & architecture: docs/PHANTOM_THEORY.md (§5–§7)
+//
+// CORE (recall layer) — the ONLY hard conditions:
+//   SHORT: high pokes above a tracked swing high AND close back below it
+//   LONG : low pokes below a tracked swing low  AND close back above it
+//
+// Everything that used to be a boolean filter is now a bounded
+// evidence score in [0,1]:
+//   s1 sweep-depth shape (ATR units)     s5 approach drift quality
+//   s2 rejection strength                s6 volume climax
+//   s3 level maturity                    s7 level freshness (soft virgin)
+//   s4 relative-value divergence (z-spread vs reference symbol)
+// Signal fires on ONE threshold over the weighted average.
+// Near-misses render as "ghosts" with a hover breakdown, so missed
+// setups are diagnosable instead of invisible. The per-band stats
+// table verifies the score is monotone (higher band → higher WR);
+// if it isn't, reweight — don't add gates.
+// ================================================================
+
+// ========== SESSION ==========
+session_time     = input.session("2200-2100", "Trading Session", group="Session")
+open_buffer_mins = input.int(5, "Open Buffer (minutes)", minval=0, maxval=30, group="Session")
+
+// ========== SWING DETECTION ==========
+pivot_left    = input.int(10,  "Pivot Left Bars",  minval=2, maxval=50, group="Swing Detection")
+pivot_right   = input.int(1,   "Pivot Right Bars", minval=1, maxval=5,  group="Swing Detection")
+max_level_age = input.int(120, "Max Level Age (bars)", minval=10, maxval=1000, group="Swing Detection", tooltip="Levels older than this are dropped from the inventory.")
+brk_atr       = input.float(0.5, "Structural Break (ATR)", minval=0.1, maxval=3.0, step=0.1, group="Swing Detection", tooltip="A CLOSE beyond the level by this many ATRs removes it (trend continuation, not a sweep candidate).")
+
+// ========== RELATIVE VALUE LEG ==========
+use_rv    = input.bool(true, "Use Relative-Value Divergence", group="Relative Value", tooltip="When off, s4 sits at neutral 0.5 and the detector runs on pure ES sweep mechanics.")
+rv_symbol = input.symbol("CME_MINI:NQ1!", "Reference Symbol", group="Relative Value", tooltip="Any market that normally co-moves with ES: NQ, XLF, XLK/XLU, ZN...")
+rv_len    = input.int(120, "Z-Score Window (bars)", minval=20, maxval=1000, group="Relative Value")
+rv_d0     = input.float(1.0, "Divergence Scale (z units)", minval=0.1, maxval=5.0, step=0.1, group="Relative Value", tooltip="z-spread at which divergence evidence reaches ~0.73. Smaller = more sensitive.")
+
+// ========== SCORE SHAPE ==========
+pen_full_atr   = input.float(0.10, "Sweep Depth Full Credit (ATR)", minval=0.01, maxval=1.0,  step=0.01, group="Score Shape", tooltip="Penetration (in ATRs) at which sweep-depth evidence reaches 1.")
+pen_soft_atr   = input.float(0.60, "Sweep Depth Decay Start (ATR)", minval=0.1,  maxval=3.0,  step=0.05, group="Score Shape")
+pen_hard_atr   = input.float(1.50, "Sweep Depth Zero (ATR)",        minval=0.2,  maxval=5.0,  step=0.05, group="Score Shape", tooltip="Penetration this deep scores 0 on s1 (breakout, not sweep) — but it only drags the average down, it does not veto.")
+rej_full_atr   = input.float(0.30, "Rejection Full Credit (ATR)",   minval=0.05, maxval=2.0,  step=0.05, group="Score Shape", tooltip="Close back through the level by this many ATRs = full rejection credit.")
+age_full_bars  = input.int(15, "Maturity Full Credit (bars)", minval=2, maxval=100, group="Score Shape")
+approach_bars  = input.int(10, "Approach Window (bars)",      minval=3, maxval=60,  group="Score Shape")
+appr_full_atr  = input.float(1.5, "Approach Drift Full Credit (ATR)", minval=0.2, maxval=6.0, step=0.1, group="Score Shape")
+vol_full_z     = input.float(3.0, "Volume Climax Full Credit (z)",    minval=0.5, maxval=8.0, step=0.5, group="Score Shape")
+
+// ========== WEIGHTS & THRESHOLD ==========
+w_sweep    = input.float(1.0, "w1 Sweep Depth",    minval=0.0, maxval=5.0, step=0.1, group="Weights & Threshold")
+w_reject   = input.float(1.5, "w2 Rejection",      minval=0.0, maxval=5.0, step=0.1, group="Weights & Threshold")
+w_age      = input.float(0.5, "w3 Maturity",       minval=0.0, maxval=5.0, step=0.1, group="Weights & Threshold")
+w_div      = input.float(1.5, "w4 RV Divergence",  minval=0.0, maxval=5.0, step=0.1, group="Weights & Threshold")
+w_approach = input.float(1.0, "w5 Approach",       minval=0.0, maxval=5.0, step=0.1, group="Weights & Threshold")
+w_volume   = input.float(0.5, "w6 Volume Climax",  minval=0.0, maxval=5.0, step=0.1, group="Weights & Threshold")
+w_fresh    = input.float(1.0, "w7 Freshness",      minval=0.0, maxval=5.0, step=0.1, group="Weights & Threshold")
+score_thr  = input.float(0.65, "Signal Threshold",     minval=0.0, maxval=1.0, step=0.01, group="Weights & Threshold", tooltip="THE one sensitivity knob. Lower = more signals.")
+ghost_thr  = input.float(0.50, "Ghost Threshold",      minval=0.0, maxval=1.0, step=0.01, group="Weights & Threshold", tooltip="Candidates scoring between this and the signal threshold render as gray ghosts with a hover breakdown.")
+
+// ========== TRACKER ==========
+track_all      = input.bool(true, "Track All Candidates (per-band stats)", group="Tracker", tooltip="Simulates every core candidate (even sub-ghost) with the stop/target below and reports win rate per score band. Validates that the score is monotone.")
+stop_buf_atr   = input.float(0.25, "Stop Beyond Sweep Extreme (ATR)", minval=0.05, maxval=2.0, step=0.05, group="Tracker")
+tgt_rr         = input.float(1.5,  "Target (R multiple)",             minval=0.5,  maxval=5.0, step=0.25, group="Tracker")
+
+// ========== VISUAL / EXPORT ==========
+show_ghosts        = input.bool(true,  "Show Ghost Near-Misses", group="Visual")
+show_breakdown     = input.bool(false, "Always-On Breakdown Labels", group="Visual", tooltip="Breakdown is always available as hover tooltip on signals/ghosts; this adds a printed label too.")
+show_levels        = input.bool(false, "Show Active Levels", group="Visual")
+show_swept_line    = input.bool(true,  "Show Swept Level Line", group="Visual")
+show_table         = input.bool(true,  "Show Stats Table", group="Visual")
+export_features    = input.bool(false, "Export Feature Vectors via alert()", group="Visual", tooltip="Fires an alert() with the full feature vector for every core candidate. Set a TradingView alert on 'Any alert() function call' and log to webhook/email for offline logistic fitting (see PHANTOM_THEORY.md §8).")
+atr_period         = input.int(14, "ATR Period", minval=5, maxval=50, group="Visual")
+bull_color         = input.color(#089981,   "Bull Color",  group="Visual")
+bear_color         = input.color(color.red, "Bear Color",  group="Visual")
+ghost_color        = input.color(color.new(color.gray, 30), "Ghost Color", group="Visual")
+level_color        = input.color(color.new(#3179f5, 40), "Level Line Color", group="Visual")
+
+// ================================================================
+// HELPERS
+// ================================================================
+ramp(x, x0, x1) =>
+    x1 <= x0 ? (x >= x1 ? 1.0 : 0.0) : math.max(0.0, math.min(1.0, (x - x0) / (x1 - x0)))
+
+logistic(x) =>
+    1.0 / (1.0 + math.exp(-math.max(-20.0, math.min(20.0, x))))
+
+fresh_score(touches) =>
+    touches == 0 ? 1.0 : touches == 1 ? 0.5 : touches == 2 ? 0.25 : 0.1
+
+band_of(s) =>
+    s >= 0.8 ? 4 : s >= 0.7 ? 3 : s >= 0.6 ? 2 : s >= 0.5 ? 1 : 0
+
+// ================================================================
+// SHARED SERIES (global scope — required by Pine)
+// ================================================================
+atr_val  = ta.atr(atr_period)
+bar_rng  = high - low
+
+es_sma = ta.sma(close, rv_len)
+es_sd  = ta.stdev(close, rv_len)
+es_z   = es_sd > 0 ? (close - es_sma) / es_sd : 0.0
+
+rv_close = request.security(rv_symbol, timeframe.period, close)
+rv_sma   = ta.sma(rv_close, rv_len)
+rv_sd    = ta.stdev(rv_close, rv_len)
+rv_z     = rv_sd > 0 ? (rv_close - rv_sma) / rv_sd : 0.0
+rv_d     = use_rv ? es_z - rv_z : 0.0   // >0: ES rich vs reference → bear evidence
+
+vol_mean = ta.sma(volume, 50)
+vol_sd   = ta.stdev(volume, 50)
+vol_z    = vol_sd > 0 ? (volume - vol_mean) / vol_sd : 0.0
+s6_now   = ramp(vol_z, 0.0, vol_full_z)
+
+drift_up_atr = atr_val > 0 ? (close[1] - close[approach_bars + 1]) / atr_val : 0.0
+s5_bear_now  = ramp(drift_up_atr,  0.0, appr_full_atr)
+s5_bull_now  = ramp(-drift_up_atr, 0.0, appr_full_atr)
+
+s4_bear_now = use_rv ? logistic(rv_d / rv_d0) : 0.5
+s4_bull_now = use_rv ? logistic(-rv_d / rv_d0) : 0.5
+
+w_total = w_sweep + w_reject + w_age + w_div + w_approach + w_volume + w_fresh
+
+// ================================================================
+// SESSION
+// ================================================================
+in_session  = not na(time(timeframe.period, session_time, "UTC"))
+new_session = in_session and not in_session[1]
+
+var int session_start_bar = 0
+if new_session
+    session_start_bar := bar_index
+open_buf_bars    = math.round(open_buffer_mins * 60 / timeframe.in_seconds())
+past_open_buffer = (bar_index - session_start_bar) >= open_buf_bars
+
+// ================================================================
+// LEVEL INVENTORY
+// ================================================================
+price_pivot_high = ta.pivothigh(high, pivot_left, pivot_right)
+price_pivot_low  = ta.pivotlow( low,  pivot_left, pivot_right)
+
+var array<float> hi_price = array.new<float>(0)
+var array<int>   hi_bar   = array.new<int>(0)
+var array<int>   hi_touch = array.new<int>(0)
+var array<float> lo_price = array.new<float>(0)
+var array<int>   lo_bar   = array.new<int>(0)
+var array<int>   lo_touch = array.new<int>(0)
+
+if new_session
+    array.clear(hi_price), array.clear(hi_bar), array.clear(hi_touch)
+    array.clear(lo_price), array.clear(lo_bar), array.clear(lo_touch)
+
+if not na(price_pivot_high) and in_session
+    pb = bar_index - pivot_right
+    if pb >= session_start_bar
+        array.push(hi_price, price_pivot_high)
+        array.push(hi_bar,   pb)
+        array.push(hi_touch, 0)
+
+if not na(price_pivot_low) and in_session
+    pb = bar_index - pivot_right
+    if pb >= session_start_bar
+        array.push(lo_price, price_pivot_low)
+        array.push(lo_bar,   pb)
+        array.push(lo_touch, 0)
+
+// Age out / cap inventory
+while array.size(hi_price) > 0 and (bar_index - array.get(hi_bar, 0)) > max_level_age
+    array.shift(hi_price), array.shift(hi_bar), array.shift(hi_touch)
+while array.size(lo_price) > 0 and (bar_index - array.get(lo_bar, 0)) > max_level_age
+    array.shift(lo_price), array.shift(lo_bar), array.shift(lo_touch)
+while array.size(hi_price) > 40
+    array.shift(hi_price), array.shift(hi_bar), array.shift(hi_touch)
+while array.size(lo_price) > 40
+    array.shift(lo_price), array.shift(lo_bar), array.shift(lo_touch)
+
+// Structural break removal — a CLOSE far beyond the level is trend, not sweep
+if barstate.isconfirmed and in_session
+    if array.size(hi_price) > 0
+        for i = array.size(hi_price) - 1 to 0
+            if close > array.get(hi_price, i) + brk_atr * atr_val
+                array.remove(hi_price, i), array.remove(hi_bar, i), array.remove(hi_touch, i)
+    if array.size(lo_price) > 0
+        for i = array.size(lo_price) - 1 to 0
+            if close < array.get(lo_price, i) - brk_atr * atr_val
+                array.remove(lo_price, i), array.remove(lo_bar, i), array.remove(lo_touch, i)
+
+// ================================================================
+// DETECTION — minimal core + evidence scoring, confirmed bars only
+// ================================================================
+bool  bear_cand  = false
+float bear_score = na
+float bear_lvl   = na
+int   bear_lbar  = na
+int   bear_idx   = -1
+float b1 = na
+float b2 = na
+float b3 = na
+float b4 = na
+float b5 = na
+float b6 = na
+float b7 = na
+
+bool  bull_cand  = false
+float bull_score = na
+float bull_lvl   = na
+int   bull_lbar  = na
+int   bull_idx   = -1
+float u1 = na
+float u2 = na
+float u3 = na
+float u4 = na
+float u5 = na
+float u6 = na
+float u7 = na
+
+if barstate.isconfirmed and in_session and past_open_buffer and atr_val > 0
+    // ---- SHORT side: sweep of a swing high, close back below ----
+    if array.size(hi_price) > 0
+        for i = 0 to array.size(hi_price) - 1
+            lvl = array.get(hi_price, i)
+            if high > lvl and close < lvl                       // ← the entire hard core
+                pen = (high - lvl) / atr_val
+                s1  = ramp(pen, 0.0, pen_full_atr) * (1.0 - ramp(pen, pen_soft_atr, pen_hard_atr))
+                rej = (lvl - close) / atr_val
+                cpos = bar_rng > 0 ? (high - close) / bar_rng : 0.0
+                s2  = 0.5 * ramp(rej, 0.0, rej_full_atr) + 0.5 * cpos
+                s3  = ramp(bar_index - array.get(hi_bar, i), 3, age_full_bars)
+                s7  = fresh_score(array.get(hi_touch, i))
+                sc  = (w_sweep * s1 + w_reject * s2 + w_age * s3 + w_div * s4_bear_now + w_approach * s5_bear_now + w_volume * s6_now + w_fresh * s7) / w_total
+                if na(bear_score) or sc > bear_score
+                    bear_cand  := true
+                    bear_score := sc
+                    bear_lvl   := lvl
+                    bear_lbar  := array.get(hi_bar, i)
+                    bear_idx   := i
+                    b1 := s1
+                    b2 := s2
+                    b3 := s3
+                    b4 := s4_bear_now
+                    b5 := s5_bear_now
+                    b6 := s6_now
+                    b7 := s7
+
+    // ---- LONG side: sweep of a swing low, close back above ----
+    if array.size(lo_price) > 0
+        for i = 0 to array.size(lo_price) - 1
+            lvl = array.get(lo_price, i)
+            if low < lvl and close > lvl                        // ← the entire hard core
+                pen = (lvl - low) / atr_val
+                s1  = ramp(pen, 0.0, pen_full_atr) * (1.0 - ramp(pen, pen_soft_atr, pen_hard_atr))
+                rej = (close - lvl) / atr_val
+                cpos = bar_rng > 0 ? (close - low) / bar_rng : 0.0
+                s2  = 0.5 * ramp(rej, 0.0, rej_full_atr) + 0.5 * cpos
+                s3  = ramp(bar_index - array.get(lo_bar, i), 3, age_full_bars)
+                s7  = fresh_score(array.get(lo_touch, i))
+                sc  = (w_sweep * s1 + w_reject * s2 + w_age * s3 + w_div * s4_bull_now + w_approach * s5_bull_now + w_volume * s6_now + w_fresh * s7) / w_total
+                if na(bull_score) or sc > bull_score
+                    bull_cand  := true
+                    bull_score := sc
+                    bull_lvl   := lvl
+                    bull_lbar  := array.get(lo_bar, i)
+                    bull_idx   := i
+                    u1 := s1
+                    u2 := s2
+                    u3 := s3
+                    u4 := s4_bull_now
+                    u5 := s5_bull_now
+                    u6 := s6_now
+                    u7 := s7
+
+bear_signal = bear_cand and bear_score >= score_thr
+bull_signal = bull_cand and bull_score >= score_thr
+bear_ghost  = bear_cand and not bear_signal and bear_score >= ghost_thr
+bull_ghost  = bull_cand and not bull_signal and bull_score >= ghost_thr
+
+// Consume the swept level on a fired signal (natural dedup — no cooldown gate)
+if bear_signal and bear_idx >= 0 and bear_idx < array.size(hi_price)
+    array.remove(hi_price, bear_idx), array.remove(hi_bar, bear_idx), array.remove(hi_touch, bear_idx)
+if bull_signal and bull_idx >= 0 and bull_idx < array.size(lo_price)
+    array.remove(lo_price, bull_idx), array.remove(lo_bar, bull_idx), array.remove(lo_touch, bull_idx)
+
+// Touch accounting AFTER detection — crossings devalue (never veto) future retests
+if barstate.isconfirmed and in_session
+    if array.size(hi_price) > 0
+        for i = 0 to array.size(hi_price) - 1
+            if bar_index > array.get(hi_bar, i) and high > array.get(hi_price, i)
+                array.set(hi_touch, i, array.get(hi_touch, i) + 1)
+    if array.size(lo_price) > 0
+        for i = 0 to array.size(lo_price) - 1
+            if bar_index > array.get(lo_bar, i) and low < array.get(lo_price, i)
+                array.set(lo_touch, i, array.get(lo_touch, i) + 1)
+
+// ================================================================
+// RENDER
+// ================================================================
+breakdown_txt(s1, s2, s3, s4, s5, s6, s7, sc) =>
+    "score " + str.tostring(sc, "0.00") +
+     "\ns1 sweep    " + str.tostring(s1, "0.00") +
+     "\ns2 reject   " + str.tostring(s2, "0.00") +
+     "\ns3 maturity " + str.tostring(s3, "0.00") +
+     "\ns4 RV div   " + str.tostring(s4, "0.00") +
+     "\ns5 approach " + str.tostring(s5, "0.00") +
+     "\ns6 volume   " + str.tostring(s6, "0.00") +
+     "\ns7 fresh    " + str.tostring(s7, "0.00")
+
+var int n_signals = 0
+var int n_ghosts  = 0
+
+if bear_signal
+    n_signals += 1
+    tt = breakdown_txt(b1, b2, b3, b4, b5, b6, b7, bear_score)
+    label.new(bar_index, high, "SHORT " + str.tostring(bear_score, "0.00"), yloc=yloc.abovebar, color=bear_color, style=label.style_label_down, textcolor=color.white, size=size.small, tooltip=tt)
+    if show_breakdown
+        label.new(bar_index, high + 2 * atr_val, tt, color=color.new(color.black, 30), style=label.style_label_down, textcolor=color.white, size=size.tiny)
+    if show_swept_line
+        line.new(bear_lbar, bear_lvl, bar_index + 10, bear_lvl, color=level_color, width=2)
+
+if bull_signal
+    n_signals += 1
+    tt = breakdown_txt(u1, u2, u3, u4, u5, u6, u7, bull_score)
+    label.new(bar_index, low, "LONG " + str.tostring(bull_score, "0.00"), yloc=yloc.belowbar, color=bull_color, style=label.style_label_up, textcolor=color.white, size=size.small, tooltip=tt)
+    if show_breakdown
+        label.new(bar_index, low - 2 * atr_val, tt, color=color.new(color.black, 30), style=label.style_label_up, textcolor=color.white, size=size.tiny)
+    if show_swept_line
+        line.new(bull_lbar, bull_lvl, bar_index + 10, bull_lvl, color=level_color, width=2)
+
+if show_ghosts and bear_ghost
+    n_ghosts += 1
+    label.new(bar_index, high, str.tostring(bear_score, "0.00"), yloc=yloc.abovebar, color=ghost_color, style=label.style_label_down, textcolor=color.white, size=size.tiny, tooltip="GHOST short (below threshold)\n" + breakdown_txt(b1, b2, b3, b4, b5, b6, b7, bear_score))
+
+if show_ghosts and bull_ghost
+    n_ghosts += 1
+    label.new(bar_index, low, str.tostring(bull_score, "0.00"), yloc=yloc.belowbar, color=ghost_color, style=label.style_label_up, textcolor=color.white, size=size.tiny, tooltip="GHOST long (below threshold)\n" + breakdown_txt(u1, u2, u3, u4, u5, u6, u7, bull_score))
+
+if show_levels
+    if array.size(hi_price) > 0
+        for i = 0 to array.size(hi_price) - 1
+            dim = array.get(hi_touch, i) > 0
+            l = line.new(array.get(hi_bar, i), array.get(hi_price, i), bar_index, array.get(hi_price, i), color=dim ? color.new(color.gray, 85) : color.new(bear_color, 70), style=line.style_dotted)
+            line.delete(l[1])
+    if array.size(lo_price) > 0
+        for i = 0 to array.size(lo_price) - 1
+            dim = array.get(lo_touch, i) > 0
+            l = line.new(array.get(lo_bar, i), array.get(lo_price, i), bar_index, array.get(lo_price, i), color=dim ? color.new(color.gray, 85) : color.new(bull_color, 70), style=line.style_dotted)
+            line.delete(l[1])
+
+// ================================================================
+// FEATURE EXPORT (offline logistic fitting — THEORY.md §8)
+// ================================================================
+if export_features and bear_cand
+    alert("PHANTOM7,short," + str.tostring(time) + ",score=" + str.tostring(bear_score, "0.000") + ",s1=" + str.tostring(b1, "0.000") + ",s2=" + str.tostring(b2, "0.000") + ",s3=" + str.tostring(b3, "0.000") + ",s4=" + str.tostring(b4, "0.000") + ",s5=" + str.tostring(b5, "0.000") + ",s6=" + str.tostring(b6, "0.000") + ",s7=" + str.tostring(b7, "0.000") + ",lvl=" + str.tostring(bear_lvl) + ",close=" + str.tostring(close), alert.freq_once_per_bar_close)
+if export_features and bull_cand
+    alert("PHANTOM7,long," + str.tostring(time) + ",score=" + str.tostring(bull_score, "0.000") + ",s1=" + str.tostring(u1, "0.000") + ",s2=" + str.tostring(u2, "0.000") + ",s3=" + str.tostring(u3, "0.000") + ",s4=" + str.tostring(u4, "0.000") + ",s5=" + str.tostring(u5, "0.000") + ",s6=" + str.tostring(u6, "0.000") + ",s7=" + str.tostring(u7, "0.000") + ",lvl=" + str.tostring(bull_lvl) + ",close=" + str.tostring(close), alert.freq_once_per_bar_close)
+
+// ================================================================
+// PER-BAND OUTCOME TRACKER — validates score monotonicity
+// Every core candidate is simulated (stop beyond sweep extreme,
+// fixed-R target) and bucketed by score band.
+// ================================================================
+var array<int> band_trades = array.new<int>(5, 0)
+var array<int> band_wins   = array.new<int>(5, 0)
+
+var array<float> tr_entry = array.new<float>(0)
+var array<float> tr_stop  = array.new<float>(0)
+var array<float> tr_tgt   = array.new<float>(0)
+var array<int>   tr_dir   = array.new<int>(0)
+var array<int>   tr_band  = array.new<int>(0)
+
+if track_all and barstate.isconfirmed
+    if bear_cand
+        stp = high + stop_buf_atr * atr_val
+        rsk = stp - close
+        if rsk > 0
+            array.push(tr_entry, close), array.push(tr_stop, stp)
+            array.push(tr_tgt, close - tgt_rr * rsk)
+            array.push(tr_dir, -1), array.push(tr_band, band_of(bear_score))
+    if bull_cand
+        stp = low - stop_buf_atr * atr_val
+        rsk = close - stp
+        if rsk > 0
+            array.push(tr_entry, close), array.push(tr_stop, stp)
+            array.push(tr_tgt, close + tgt_rr * rsk)
+            array.push(tr_dir, 1), array.push(tr_band, band_of(bull_score))
+
+if track_all and barstate.isconfirmed and array.size(tr_entry) > 0
+    for i = array.size(tr_entry) - 1 to 0
+        d   = array.get(tr_dir, i)
+        tgt = array.get(tr_tgt, i)
+        stp = array.get(tr_stop, i)
+        bnd = array.get(tr_band, i)
+        hit_t = (d == -1 and low <= tgt) or (d == 1 and high >= tgt)
+        hit_s = (d == -1 and high >= stp) or (d == 1 and low <= stp)
+        if hit_t or hit_s
+            array.set(band_trades, bnd, array.get(band_trades, bnd) + 1)
+            if hit_t and not hit_s
+                array.set(band_wins, bnd, array.get(band_wins, bnd) + 1)
+            array.remove(tr_entry, i), array.remove(tr_stop, i), array.remove(tr_tgt, i)
+            array.remove(tr_dir, i), array.remove(tr_band, i)
+
+// ================================================================
+// STATS TABLE
+// ================================================================
+var table st = table.new(position.top_right, 3, 9, bgcolor=color.new(color.black, 75), border_width=1, frame_width=1, frame_color=color.new(color.gray, 60))
+
+if barstate.islast and show_table
+    gray = color.gray
+    wht  = color.white
+    table.cell(st, 0, 0, "Score Band", text_color=gray, text_size=size.tiny)
+    table.cell(st, 1, 0, "Trades",     text_color=gray, text_size=size.tiny)
+    table.cell(st, 2, 0, "Win Rate",   text_color=gray, text_size=size.tiny)
+    band_names = array.from("< 0.50", "0.50–0.60", "0.60–0.70", "0.70–0.80", "≥ 0.80")
+    for b = 0 to 4
+        n = array.get(band_trades, b)
+        w = array.get(band_wins, b)
+        wr = n > 0 ? 100.0 * w / n : na
+        in_play = (b + 1) * 0.1 + 0.4 > score_thr
+        table.cell(st, 0, b + 1, array.get(band_names, b), text_color=in_play ? wht : gray, text_size=size.tiny)
+        table.cell(st, 1, b + 1, str.tostring(n), text_color=wht, text_size=size.tiny)
+        table.cell(st, 2, b + 1, na(wr) ? "—" : str.tostring(wr, "#.0") + "% (" + str.tostring(w) + ")", text_color=na(wr) ? gray : wr >= 50 ? color.green : color.red, text_size=size.tiny)
+    table.cell(st, 0, 6, "Signals", text_color=gray, text_size=size.tiny)
+    table.cell(st, 1, 6, str.tostring(n_signals), text_color=wht, text_size=size.tiny)
+    table.cell(st, 2, 6, "thr " + str.tostring(score_thr, "0.00"), text_color=gray, text_size=size.tiny)
+    table.cell(st, 0, 7, "Ghosts", text_color=gray, text_size=size.tiny)
+    table.cell(st, 1, 7, str.tostring(n_ghosts), text_color=wht, text_size=size.tiny)
+    table.cell(st, 2, 7, "ghost " + str.tostring(ghost_thr, "0.00"), text_color=gray, text_size=size.tiny)
+    table.cell(st, 0, 8, "RV spread z", text_color=gray, text_size=size.tiny)
+    table.cell(st, 1, 8, use_rv ? str.tostring(rv_d, "0.00") : "off", text_color=wht, text_size=size.tiny)
+    table.cell(st, 2, 8, "", text_color=gray, text_size=size.tiny)
+
+if new_session
+    line.new(bar_index, high, bar_index, low, color=color.new(color.gray, 60), extend=extend.both, style=line.style_dotted)
+
+// ================================================================
+// ALERTS
+// ================================================================
+alertcondition(bear_signal, "Short Signal", "PHANTOM7: Short — scored sweep of swing high")
+alertcondition(bull_signal, "Long Signal",  "PHANTOM7: Long — scored sweep of swing low")
+alertcondition(bear_signal or bull_signal, "Any Signal", "PHANTOM7: Signal fired")
